@@ -97,11 +97,12 @@ RBRACE : '}' ;
 SEMI   : ';' ;
 
 // Literals
-BOOL   : 'true' | 'false' ;
 INT    : [0-9]+ ;
 
 // "hello", with basic escapes like \" and \\ and \n
 STRING : '"' ( '\\' [btnfr"\\] | ~["\\] )* '"' ;
+
+BOOL   : 'true' | 'false' ;
 
 // Identifier (must come AFTER keywords so keywords match first)
 ID     : [a-zA-Z_][a-zA-Z0-9_]* ;
