@@ -1,0 +1,14 @@
+let x = 3;
+let msg = "hello";
+
+print(x + 2);
+
+while (x < 10) {
+  x = x + 1;
+  if (x == 7) {
+    print("hit seven");
+  } else {
+    
+    print(x);
+  }
+}
