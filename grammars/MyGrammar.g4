@@ -1,9 +1,9 @@
 // --------------------
 // Parser rules
 // --------------------
-grammar assignment_1;
+grammar MyGrammar;
 
-file : (expression SC)* EOF ;
+program : (expression SC)* EOF ;
 expression : expression PLUS expression | 
              expression MINUS expression | 
              expression STAR expression | 
