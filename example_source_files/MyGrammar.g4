@@ -104,8 +104,7 @@ STRING : '"' ( '\\' [btnfr"\\] | ~["\\] )* '"' ;
 
 BOOL   : 'true' | 'false' ;
 
-// Identifier (must come AFTER keywords so keywords match first)
-ID     : [a-zA-Z_][a-zA-Z0-9_]* ;
+
 
 // Skip whitespace and comments
 WS           : [ \t\r\n]+ -> skip ;
