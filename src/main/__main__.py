@@ -12,6 +12,7 @@ from .gen.assignment_1Lexer import assignment_1Lexer
 from .gen.assignment_1Parser import assignment_1Parser
 from ..parser.ast_visitor import CSTtoASTVisitor
 from ..parser.constant_folding_visitor import ConstantFoldingVisitor
+from ..parser.ast_dot_visitor import ASTDotVisitor
 
 
 def main():
@@ -103,8 +104,22 @@ def main():
     # Dit doen we in de volgende stap wanneer we de
     # Graphviz visitor schrijven.
     if args.render_ast:
-        print(f"\nTODO: AST renderen naar {args.render_ast}")
+        dot = ASTDotVisitor()
 
+        # Maak een root node zodat je meerdere expressions in 1 graph kan tonen
+        program_id = dot.new_id()
+        dot.create_node(program_id, "Program")
+
+        for i, expr in enumerate(ast_nodes):
+            expr_id = expr.accept(dot)
+            dot.create_edge(program_id, expr_id, f"expr[{i}]")
+
+        dot_text = dot.finalize()
+
+        with open(args.render_ast, "w") as file:
+            file.write(dot_text)
+
+        print(f"\nAST DOT geschreven naar: {args.render_ast}")
 
 if __name__ == "__main__":
     main()
