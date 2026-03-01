@@ -68,6 +68,10 @@ def main():
     parser = assignment_1Parser(tokens)
     cst = parser.program()  # 'program' is onze startegel
 
+    if parser.getNumberOfSyntaxErrors() > 0:
+        print("Syntax errors: the given input is invalid")
+        return
+
     # --------------------------------------------------------
     # Stap 3: zet de CST om naar onze eigen AST
     # --------------------------------------------------------

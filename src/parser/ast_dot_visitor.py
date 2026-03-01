@@ -17,7 +17,6 @@ class ASTDotVisitor:
         self.lines.append("node [shape=box];")
 
 
-
     def new_id(self):
         self._next_id += 1
         return f"n{self._next_id}"
@@ -31,7 +30,7 @@ class ASTDotVisitor:
         else:
             self.lines.append(f'  {src} -- {dst} [label=\"{edge_label}\"];')
 
-    # ---- The 3 methods your AST nodes will call via accept() ----
+    # ---- 3 methodes that are called by AST node
     def visitLiteral(self, node):
         my_id = self.new_id()
         self.create_node(my_id, f"Literal({node.value})")
