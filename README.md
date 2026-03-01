@@ -5,7 +5,7 @@ This repository contains Group 5’s Compilers course project. We are building a
 ## 1. Generate the parser and visitor
 Generate the parser and visitor classes in Python using the following command:
 ``` bash
-java -jar antlr-4.12.0-complete.jar -Dlanguage=Python3 MyGrammar.g4 -visitor
+java -jar antlr-4.13.2-complete.jar -Dlanguage=Python3 -visitor grammars/assignment_1.g4 -o src/main/gen
 ```
 
 This will generate: - `MyGrammarLexer.py` - `MyGrammarParser.py` -
