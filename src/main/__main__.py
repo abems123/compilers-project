@@ -8,8 +8,8 @@ import argparse
 # ANTLR klassen om de input te lezen en tokens te maken
 from antlr4 import FileStream, CommonTokenStream
 
-from .gen.assignment_1Lexer import assignment_1Lexer
-from .gen.assignment_1Parser import assignment_1Parser
+from .gen.MyGrammarLexer import MyGrammarLexer
+from .gen.MyGrammarParser import MyGrammarParser
 from ..parser.ast_visitor import CSTtoASTVisitor
 from ..parser.constant_folding_visitor import ConstantFoldingVisitor
 from ..parser.ast_dot_visitor import ASTDotVisitor
@@ -61,11 +61,11 @@ def main():
 
     # De lexer splitst de tekst op in tokens
     # Voorbeeld: "3 + 4" → [INTEGER(3), PLUS, INTEGER(4)]
-    lexer = assignment_1Lexer(source)
+    lexer = MyGrammarLexer(source)
     tokens = CommonTokenStream(lexer)
 
     # De parser zet de tokens om in een CST
-    parser = assignment_1Parser(tokens)
+    parser = MyGrammarParser(tokens)
     cst = parser.program()  # 'program' is onze startegel
 
     if parser.getNumberOfSyntaxErrors() > 0:
