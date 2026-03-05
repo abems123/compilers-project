@@ -174,6 +174,15 @@ class ConstantFoldingVisitor:
             l = left.value
             r = right.value
 
+            # char literals zijn Python strings ('a'), maar in C zijn het getallen (ASCII).
+            # We zetten ze om naar hun ASCII waarde voor rekenkundige operaties.
+            # Na de berekening zetten we het resultaat NIET terug naar een char —
+            # want 'a' + 1 = 98 (int), niet 'b'. Alleen een expliciete cast doet dat.
+            if isinstance(l, str):
+                l = ord(l)
+            if isinstance(r, str):
+                r = ord(r)
+
             if node.op == '+':
                 resultaat = l + r
             elif node.op == '-':

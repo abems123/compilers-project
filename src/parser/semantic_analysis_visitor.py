@@ -254,11 +254,15 @@ class SemanticAnalysisVisitor:
             )
 
         elif isinstance(node.target, UnaryOpNode) and node.target.op == '*':
-            # *ptr = value → check of de pointer zelf niet const is
+            # *ptr = value → check of de pointer gedeclareerd is én niet const
             ptr_node = node.target.operand
             if isinstance(ptr_node, VariableNode):
                 entry = self.symbol_table.lookup(ptr_node.name)
-                if entry and entry.is_const:
+                if entry is None:
+                    # pointer zelf is niet gedeclareerd
+                    self.error(f"Gebruik van niet-gedeclareerde variabele '{ptr_node.name}'.")
+                elif entry.is_const:
+                    # const int* ptr → *ptr = ... is niet toegestaan
                     self.error(
                         f"Assignment via const pointer '*{ptr_node.name}': "
                         f"de waarde waarnaar gewezen wordt is const."

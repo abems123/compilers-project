@@ -1,6 +1,6 @@
 // Elke grammar file moet beginnen met de naam.
 // De naam moet exact overeenkomen met de bestandsnaam!
-grammar MyGrammar;
+grammar assignment_3;
 
 // --------------------
 // Parser rules
