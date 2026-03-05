@@ -7,11 +7,16 @@ grammar assignment_3;
 // --------------------
 
 // ── NIEUW: #include <stdio.h> bovenaan het programma ────────────────────────
-// We staan nul of meer includes toe vóór de main functie.
-// We gebruiken het INCLUDE_STDIO token dat hieronder als één lexer regel
-// gedefinieerd is, zodat we geen conflict krijgen met < en > operatoren.
+// We staan een mix van includes EN comments toe vóór de main functie.
+// Waarom (includeStmt | comment)* en niet includeStmt*?
+//   Een comment vóór int main() is syntactisch geldig in C:
+//     // mijn programma
+//     #include <stdio.h>
+//     /* beschrijving */
+//     int main() { ... }
+//   Met alleen includeStmt* zou de parser crashen op de eerste comment.
 program
-    : includeStmt* INT_KW MAIN LPAREN RPAREN block EOF
+    : (includeStmt | comment)* INT_KW MAIN LPAREN RPAREN block EOF
     ;
 
 includeStmt
@@ -121,52 +126,51 @@ comment
     ;
 
 // Expressies (uitgebreid met array toegang en string literals)
+//
+// PRIORITEIT: hogere regels = hogere prioriteit (ANTLR kiest eerste match).
+//
+// WAAROM array toegang [] bovenaan?
+//   values[0] + values[1] moet worden: (values[0]) + (values[1])
+//   Als [] lager staat dan +, parseert ANTLR het als: (values[0] + values)[1]  ← fout!
+//   Oplossing: [] staat als EERSTE alternatief → hoogste prioriteit.
 expression
-    : expression STAR        expression   // vermenigvuldiging:       3 * 4
-    | expression SLASH       expression   // deling:                  6 / 2
-    | expression PERCENT     expression   // modulo:                  7 % 3
-    | expression PLUS        expression   // optelling:               3 + 4
-    | expression MINUS       expression   // aftrekking:              5 - 1
-    | expression LSHIFT      expression   // shift left:              x << 2
-    | expression RSHIFT      expression   // shift right:             x >> 1
-    | expression LT          expression   // kleiner dan:             x < 5
-    | expression LEQ         expression   // kleiner of gelijk:       x <= 5
-    | expression GT          expression   // groter dan:              x > 5
-    | expression GEQ         expression   // groter of gelijk:        x >= 5
-    | expression EQ          expression   // gelijk aan:              x == 5
-    | expression NOTEQ       expression   // niet gelijk aan:         x != 5
-    | expression AND         expression   // bitwise AND:             x & y
-    | expression HAT         expression   // bitwise XOR:             x ^ y
-    | expression OR          expression   // bitwise OR:              x | y
-    | expression ANDAND      expression   // logische AND:            x && y
-    | expression OROR        expression   // logische OR:             x || y
-    | expression PLUSPLUS                 // suffix ++:               x++
-    | expression MINUSMINUS              // suffix --:               x--
-    // ── NIEUW: Array toegang ─────────────────────────────────────────────────
-    // arr[i]    → expression LBRACKET expression RBRACKET
-    // arr[i][j] → dit werkt automatisch door links-recursie:
-    //             (arr[i])[j] = expression[j]
-    | expression LBRACKET expression RBRACKET  // array toegang: arr[i]
-    // ── NIEUW: function call als expressie (return waarde gebruiken) ─────────
-    // int n = printf("hello");
-    | functionCall
-    | MINUS      expression               // unaire min:              -3
-    | PLUS       expression               // unaire plus:             +3
-    | EXMARK     expression               // logische NOT:            !x
-    | TILDE      expression               // bitwise NOT:             ~x
-    | AND        expression               // address-of:              &x
-    | STAR       expression               // pointer dereference:     *ptr
-    | PLUSPLUS   expression               // prefix ++:               ++x
-    | MINUSMINUS expression               // prefix --:               --x
-    | LPAREN type RPAREN expression       // cast:                    (int) x
-    | LPAREN expression RPAREN            // haakjes:                 (3 + 4)
-    | INTEGER                             // integer literal:         42
-    | FLOAT                              // float literal:           3.14
-    | ID                                  // variabele:               x
-    | CHAR                               // char literal:            'a'
-    // ── NIEUW: String literal ────────────────────────────────────────────────
-    // "hello"  →  STRING token
-    | STRING                              // string literal:          "hello"
+    : expression LBRACKET expression RBRACKET  // array toegang:  arr[i]  (hoogste prio!)
+    | expression PLUSPLUS                       // suffix ++:      x++
+    | expression MINUSMINUS                     // suffix --:      x--
+    | functionCall                              // functie aanroep: printf(...)
+    | expression STAR        expression         // vermenigvuldiging:  3 * 4
+    | expression SLASH       expression         // deling:             6 / 2
+    | expression PERCENT     expression         // modulo:             7 % 3
+    | expression PLUS        expression         // optelling:          3 + 4
+    | expression MINUS       expression         // aftrekking:         5 - 1
+    | expression LSHIFT      expression         // shift left:         x << 2
+    | expression RSHIFT      expression         // shift right:        x >> 1
+    | expression LT          expression         // kleiner dan:        x < 5
+    | expression LEQ         expression         // kleiner of gelijk:  x <= 5
+    | expression GT          expression         // groter dan:         x > 5
+    | expression GEQ         expression         // groter of gelijk:   x >= 5
+    | expression EQ          expression         // gelijk aan:         x == 5
+    | expression NOTEQ       expression         // niet gelijk aan:    x != 5
+    | expression AND         expression         // bitwise AND:        x & y
+    | expression HAT         expression         // bitwise XOR:        x ^ y
+    | expression OR          expression         // bitwise OR:         x | y
+    | expression ANDAND      expression         // logische AND:       x && y
+    | expression OROR        expression         // logische OR:        x || y
+    | MINUS      expression                     // unaire min:         -3
+    | PLUS       expression                     // unaire plus:        +3
+    | EXMARK     expression                     // logische NOT:       !x
+    | TILDE      expression                     // bitwise NOT:        ~x
+    | AND        expression                     // address-of:         &x
+    | STAR       expression                     // pointer deref:      *ptr
+    | PLUSPLUS   expression                     // prefix ++:          ++x
+    | MINUSMINUS expression                     // prefix --:          --x
+    | LPAREN type RPAREN expression             // cast:               (int) x
+    | LPAREN expression RPAREN                  // haakjes:            (3 + 4)
+    | INTEGER                                   // integer literal:    42
+    | FLOAT                                     // float literal:      3.14
+    | ID                                        // variabele:          x
+    | CHAR                                      // char literal:       'a'
+    | STRING                                    // string literal:     "hello"
     ;
 
 // --------------------
