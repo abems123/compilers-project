@@ -1,18 +1,19 @@
 # src/main/__main__.py
 
-# argparse is een ingebouwde Python library om command line
-# argumenten te lezen. Zo kan je bv. --input en --render_ast
-# meegeven wanneer je het programma uitvoert.
 import argparse
+from pathlib import Path
 
-# ANTLR klassen om de input te lezen en tokens te maken
 from antlr4 import FileStream, CommonTokenStream
 
-from .gen.MyGrammarLexer import MyGrammarLexer
-from .gen.MyGrammarParser import MyGrammarParser
-from ..parser.ast_visitor import CSTtoASTVisitor
-from ..parser.constant_folding_visitor import ConstantFoldingVisitor
-from ..parser.ast_dot_visitor import ASTDotVisitor
+# BELANGRIJK: genereer de parser eerst met:
+# java -jar antlr-4.13.2-complete.jar -Dlanguage=Python3 -visitor grammars/assignment_2.g4 -o src/main/gen
+from .gen.MyGrammarLexer   import MyGrammarLexer
+from .gen.MyGrammarParser  import MyGrammarParser
+
+from ..parser.ast_visitor                import CSTtoASTVisitor
+from ..parser.constant_folding_visitor   import ConstantFoldingVisitor
+from ..parser.ast_dot_visitor            import ASTDotVisitor
+from ..parser.semantic_analysis_visitor  import SemanticAnalysisVisitor
 
 
 def main():
@@ -20,110 +21,94 @@ def main():
     # --------------------------------------------------------
     # Stap 1: lees de command line argumenten
     # --------------------------------------------------------
-    # ArgumentParser maakt een object dat de argumenten beheert.
-    # description is wat getoond wordt bij --help.
-
     arg_parser = argparse.ArgumentParser(
-        description="Assignment 1 compiler: expression parser"
+        description="Assignment 2 compiler: types and variables"
     )
 
-    # --input is verplicht: het pad naar het input bestand
     arg_parser.add_argument(
         "--input",
         required=True,
-        help="Pad naar het input bestand"
+        help="Pad naar het input bestand (C broncode)"
     )
 
-    # --render_ast is optioneel: pad naar het output dot bestand
-    # Als je dit niet meegeeft, wordt de AST niet gevisualiseerd
     arg_parser.add_argument(
         "--render_ast",
         required=False,
-        help="Pad naar het output dot bestand voor de AST visualisatie"
+        help="Pad naar het output .dot bestand voor AST visualisatie"
     )
 
-    # --no_folding is optioneel: zet constant folding uit
-    # Handig voor testen: zo kan je de AST voor en na vergelijken
     arg_parser.add_argument(
         "--no_folding",
         action="store_true",
-        help="Zet constant folding uit"
+        help="Zet constant folding en constant propagation uit"
     )
 
-    # Verwerk de argumenten
     args = arg_parser.parse_args()
 
     # --------------------------------------------------------
     # Stap 2: lees het input bestand en maak de CST
     # --------------------------------------------------------
-    # FileStream leest het bestand in
     source = FileStream(args.input, encoding="utf-8")
-
-    # De lexer splitst de tekst op in tokens
-    # Voorbeeld: "3 + 4" → [INTEGER(3), PLUS, INTEGER(4)]
-    lexer = MyGrammarLexer(source)
+    lexer  = MyGrammarLexer(source)
     tokens = CommonTokenStream(lexer)
 
-    # De parser zet de tokens om in een CST
     parser = MyGrammarParser(tokens)
-    cst = parser.program()  # 'program' is onze startegel
+    cst    = parser.program()
 
+    # stop meteen als er syntax fouten zijn
     if parser.getNumberOfSyntaxErrors() > 0:
-        print("Syntax errors: the given input is invalid")
+        print("Syntax errors gevonden: het programma is ongeldig.")
         return
 
     # --------------------------------------------------------
     # Stap 3: zet de CST om naar onze eigen AST
     # --------------------------------------------------------
     ast_builder = CSTtoASTVisitor()
-
-    # visit() start de visitor op de wortel van de CST
-    # Het resultaat is een lijst van ASTNodes (één per expressie)
-    ast_nodes = ast_builder.visit(cst)
+    ast = ast_builder.visit(cst)
 
     # --------------------------------------------------------
-    # Stap 4: constant folding (optioneel)
+    # Stap 4: semantische analyse
     # --------------------------------------------------------
-    # Als --no_folding NIET meegegeven is, voeren we de
-    # optimalisatie uit
+    # De semantic analysis loopt VOOR constant folding,
+    # zodat we de originele variabelenamen en types nog zien.
+    # (Na folding zijn variabelen soms al vervangen door literals.)
+    semantic = SemanticAnalysisVisitor()
+    ast.accept(semantic)
+    semantic.print_results()
+
+    # stop als er semantische fouten zijn
+    if semantic.has_errors():
+        return
+
+    # --------------------------------------------------------
+    # Stap 5: constant folding + propagation (optioneel)
+    # --------------------------------------------------------
     if not args.no_folding:
         folder = ConstantFoldingVisitor()
-
-        # Vouw elke expressie apart
-        ast_nodes = [node.accept(folder) for node in ast_nodes]
+        ast = ast.accept(folder)
 
     # --------------------------------------------------------
-    # Stap 5: print het resultaat (tijdelijk, voor debugging)
+    # Stap 6: print het resultaat (voor debugging)
     # --------------------------------------------------------
-    # Later vervangen we dit door de Graphviz visualisatie.
-    # Voor nu printen we gewoon de knopen zodat je kan zien
-    # of alles werkt.
-    print("AST knopen:")
-    for node in ast_nodes:
-        print(f"  {node}")
+    print("\nAST:")
+    print(f"  {ast}")
 
     # --------------------------------------------------------
-    # Stap 6: render de AST als dot bestand (optioneel)
+    # Stap 7: render de AST als .dot bestand (optioneel)
     # --------------------------------------------------------
-    # Dit doen we in de volgende stap wanneer we de
-    # Graphviz visitor schrijven.
     if args.render_ast:
         dot = ASTDotVisitor()
-
-        # Maak een root node zodat je meerdere expressions in 1 graph kan tonen
-        program_id = dot.new_id()
-        dot.create_node(program_id, "Program")
-
-        for i, expr in enumerate(ast_nodes):
-            expr_id = expr.accept(dot)
-            dot.create_edge(program_id, expr_id, f"expr[{i}]")
-
+        ast.accept(dot)
         dot_text = dot.finalize()
 
-        with open(args.render_ast, "w") as file:
-            file.write(dot_text)
+        output_path = Path(args.render_ast)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(dot_text)
 
         print(f"\nAST DOT geschreven naar: {args.render_ast}")
+
 
 if __name__ == "__main__":
     main()
