@@ -42,35 +42,35 @@ class ProgramNode(ASTNode):
     """
     De root van de hele AST. Stelt het volledige C bestand voor.
 
-    Assignment 3 uitbreiding: 'includes' lijst voor stdio.h check.
-    Assignment 4 uitbreiding: 'enums' lijst voor globale enum definities.
+    Assignment 5 herbouw: in plaats van één vaste 'body' (BlockNode voor main)
+    bevat ProgramNode nu een 'globals' lijst met alle top-level items in volgorde:
+      - IncludeNode / IncludeFileNode  (#include)
+      - DefineNode                     (#define)
+      - EnumDefNode                    (enum definities)
+      - FunctionDeclNode               (forward declarations)
+      - FunctionDefNode                (functiedefinities, incl. main)
+      - VarDeclNode                    (globale variabelen)
+      - CommentNode                    (top-level comments)
 
-    WAAROM enums apart bijhouden?
-      De semantic analysis moet enum labels kennen VOORDAT ze de body
-      van main() bezoekt. Als we enums apart opslaan in ProgramNode,
-      kan de semantic analysis ze in één eerste pass verwerken en
-      daarna pas de body analyseren.
+    WAAROM 'globals' in volgorde bewaren?
+      De semantic analysis verwerkt globals van boven naar beneden.
+      Volgorde bepaalt of een functie al gedeclareerd is vóór gebruik.
 
-    EDGE CASE: de volgorde van enums in de lijst komt overeen met de
-    volgorde in de broncode. Dit is belangrijk als een enum label
-    gebruikt wordt in een volgende enum definitie (niet ondersteund
-    in onze subset, maar de volgorde klopt wel).
+    EDGE CASE: main() is nu gewoon een FunctionDefNode in de globals lijst.
+      De semantic analysis checkt of er exact één main() aanwezig is.
 
-    EDGE CASE: backwards-compatibiliteit — bestaande code die
-    ProgramNode(body) of ProgramNode(body, includes) aanroept
-    blijft werken dankzij de default waarden.
+    EDGE CASE: backwards-compatibiliteit met visitors die visitProgram(node)
+      verwachten en node.globals itereren.
     """
-    def __init__(self, body: 'BlockNode', includes: list = None, enums: list = None):
-        self.body     = body
-        self.includes = includes if includes is not None else []
-        # lijst van EnumDefNode objecten — leeg als er geen enums zijn
-        self.enums    = enums    if enums    is not None else []
+    def __init__(self, globals: list = None):
+        # Alle top-level items in broncode-volgorde
+        self.globals = globals if globals is not None else []
 
     def accept(self, visitor):
         return visitor.visitProgram(self)
 
     def __repr__(self):
-        return f"ProgramNode(includes={self.includes}, enums={self.enums}, {self.body})"
+        return f"ProgramNode(globals={self.globals})"
 
 
 class BlockNode(ASTNode):
@@ -574,3 +574,201 @@ class ScopeNode(ASTNode):
 
     def __repr__(self):
         return f"ScopeNode({self.body})"
+
+
+# ============================================================
+# ASSIGNMENT 5 — PREPROCESSOR NODES
+# ============================================================
+
+class DefineNode(ASTNode):
+    """
+    Een #define directive, bewaard in de AST voor volledigheid.
+
+    Voorbeeld:
+      #define bool int   →  DefineNode('bool', 'int')
+      #define MAX 100    →  DefineNode('MAX', '100')
+      #define GUARD      →  DefineNode('GUARD', '')
+
+    WAAROM in de AST bewaren?
+      De preprocessor heeft de substitutie al gedaan vóór de parser.
+      We bewaren de DefineNode puur voor visualisatie en documentatie
+      van de AST. De semantic analysis en LLVM visitor negeren hem.
+
+    EDGE CASE: define zonder waarde → value = ''
+    """
+    def __init__(self, name: str, value: str):
+        self.name  = name   # 'bool', 'MAX', 'GUARD'
+        self.value = value  # 'int', '100', ''
+
+    def accept(self, visitor):
+        return visitor.visitDefine(self)
+
+    def __repr__(self):
+        return f"DefineNode({self.name!r} → {self.value!r})"
+
+
+class IncludeFileNode(ASTNode):
+    """
+    Een #include "pad/naar/file.h" directive, bewaard in de AST.
+
+    Voorbeeld:
+      #include "utils/math.h"  →  IncludeFileNode('utils/math.h')
+
+    WAAROM apart van IncludeNode (<stdio.h>)?
+      IncludeNode is voor systeemheaders (<stdio.h>).
+      IncludeFileNode is voor gebruikersheaders ("file.h").
+      De preprocessor heeft de inhoud al ingeladen; deze node is
+      puur voor AST-visualisatie.
+    """
+    def __init__(self, path: str):
+        self.path = path   # 'utils/math.h'
+
+    def accept(self, visitor):
+        return visitor.visitIncludeFile(self)
+
+    def __repr__(self):
+        return f"IncludeFileNode({self.path!r})"
+
+
+# ============================================================
+# ASSIGNMENT 5 — FUNCTIE NODES
+# ============================================================
+
+class ParamNode(ASTNode):
+    """
+    Één parameter in een functiedefinitie of -declaratie.
+
+    Voorbeelden:
+      int x          →  ParamNode(TypeNode('int', 0), 'x')
+      const float* p →  ParamNode(TypeNode('float', 1, is_const=True), 'p')
+      char c         →  ParamNode(TypeNode('char', 0), 'c')
+
+    EDGE CASE: const geldt voor het type van de parameter, niet voor
+      de pointer zelf (simplified model voor onze subset).
+    EDGE CASE: pass-by-reference via pointer → pointer_depth >= 1.
+      De semantic analysis checkt bij aanroep of de types kloppen.
+    """
+    def __init__(self, param_type: TypeNode, name: str):
+        self.param_type = param_type  # TypeNode
+        self.name       = name        # 'x', 'ptr', 'c'
+
+    def accept(self, visitor):
+        return visitor.visitParam(self)
+
+    def __repr__(self):
+        return f"ParamNode({self.param_type}, {self.name!r})"
+
+
+class FunctionDeclNode(ASTNode):
+    """
+    Een forward declaration van een functie.
+
+    Voorbeeld:
+      int mul(int x, int y);
+        → FunctionDeclNode(
+              return_type = TypeNode('int'),
+              name        = 'mul',
+              params      = [ParamNode(TypeNode('int'), 'x'),
+                             ParamNode(TypeNode('int'), 'y')]
+          )
+
+    WAAROM forward declarations bewaren?
+      De semantic analysis checkt:
+        1. Dat een definitie later BESTAAT voor elke forward decl.
+        2. Dat de definitie OVEREENKOMT in return type en parameters.
+        3. Dat functies alleen aangeroepen worden NA declaratie/definitie.
+
+    EDGE CASE: forward declaration in een header file → na #include
+      inladen staat de FunctionDeclNode gewoon in de globals lijst.
+    EDGE CASE: void return type → return_type = TypeNode('void')
+    EDGE CASE: geen parameters → params = []
+    """
+    def __init__(self, return_type: TypeNode, name: str, params: list):
+        self.return_type = return_type  # TypeNode (incl. 'void')
+        self.name        = name         # 'mul', 'main', 'foo'
+        self.params      = params       # lijst van ParamNode objecten
+
+    def accept(self, visitor):
+        return visitor.visitFunctionDecl(self)
+
+    def __repr__(self):
+        params_str = ', '.join(str(p) for p in self.params)
+        return f"FunctionDeclNode({self.return_type} {self.name!r}({params_str}))"
+
+
+class FunctionDefNode(ASTNode):
+    """
+    Een volledige functiedefinitie, inclusief body.
+
+    Voorbeeld:
+      int mul(int x, int y) { return x * y; }
+        → FunctionDefNode(
+              return_type = TypeNode('int'),
+              name        = 'mul',
+              params      = [ParamNode(TypeNode('int'), 'x'),
+                             ParamNode(TypeNode('int'), 'y')],
+              body        = BlockNode([ReturnNode(BinaryOpNode('*', ...))])
+          )
+
+    Voorbeeld (void, geen return waarde):
+      void printHello() { ... }
+        → FunctionDefNode(TypeNode('void'), 'printHello', [], BlockNode([...]))
+
+    Voorbeeld (main):
+      int main() { return 0; }
+        → FunctionDefNode(TypeNode('int'), 'main', [], BlockNode([...]))
+
+    EDGE CASE: main() is gewoon een FunctionDefNode. De semantic analysis
+      checkt dat er exact één main() bestaat.
+    EDGE CASE: recursieve aanroep → de functie roept zichzelf aan via
+      FunctionCallNode met dezelfde naam. De semantic analysis moet de
+      functie registreren VÓÓR de body bezocht wordt.
+    EDGE CASE: void functie met return; → ReturnNode(value=None) is geldig.
+    EDGE CASE: void functie zonder return → ook geldig (impliciet return).
+    EDGE CASE: non-void functie zonder return → semantic warning/error.
+    """
+    def __init__(self, return_type: TypeNode, name: str,
+                 params: list, body: BlockNode):
+        self.return_type = return_type  # TypeNode (incl. 'void')
+        self.name        = name         # 'mul', 'main', 'foo'
+        self.params      = params       # lijst van ParamNode objecten
+        self.body        = body         # BlockNode met de statements
+
+    def accept(self, visitor):
+        return visitor.visitFunctionDef(self)
+
+    def __repr__(self):
+        params_str = ', '.join(str(p) for p in self.params)
+        return (f"FunctionDefNode({self.return_type} {self.name!r}"
+                f"({params_str}), body={self.body})")
+
+
+class ReturnNode(ASTNode):
+    """
+    Een return statement.
+
+    Voorbeelden:
+      return x + y;  →  ReturnNode(value=BinaryOpNode('+', ...))
+      return 0;      →  ReturnNode(value=LiteralNode(0))
+      return;        →  ReturnNode(value=None)
+
+    EDGE CASE: return met waarde in void functie → semantic error.
+    EDGE CASE: return met verkeerd type (bv. float in int functie) →
+      semantic error of impliciete cast (afhankelijk van implementatie).
+    EDGE CASE: return buiten een functie → semantic error.
+    EDGE CASE: code NA return in hetzelfde blok → dead code.
+      De optimalisatie visitor verwijdert alle statements na een ReturnNode.
+    EDGE CASE: return in geneste if/while → springt uit de FUNCTIE,
+      niet alleen uit de if/while. De LLVM visitor genereert een
+      'ret' instructie die altijd uit de functie springt.
+    """
+    def __init__(self, value: ASTNode = None):
+        self.value = value   # de returnwaarde, of None voor 'return;'
+
+    def accept(self, visitor):
+        return visitor.visitReturn(self)
+
+    def __repr__(self):
+        if self.value is None:
+            return "ReturnNode(void)"
+        return f"ReturnNode({self.value})"

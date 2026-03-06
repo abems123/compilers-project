@@ -2,25 +2,6 @@
 
 
 class SymbolEntry:
-    """
-    Één entry in de symbol table: alle info over één variabele.
-
-    Assignment 3 uitbreiding:
-      - is_array    : True als de variabele een array is
-      - dimensions  : lijst van ints voor de array dimensies, bv. [3] of [2,4]
-                      leeg als is_array=False
-
-    Voorbeeld voor  int arr[3] :
-      SymbolEntry(name='arr', base_type='int', pointer_depth=0,
-                  is_const=False, is_defined=True,
-                  is_array=True, dimensions=[3])
-
-    Voorbeeld voor  const int* p = &z :
-      SymbolEntry(name='p', base_type='int', pointer_depth=1,
-                  is_const=True, is_defined=True,
-                  is_array=False, dimensions=[])
-    """
-
     def __init__(self, name: str, base_type: str, pointer_depth: int,
                  is_const: bool, is_defined: bool, line: int = None,
                  is_array: bool = False, dimensions: list = None):
@@ -30,14 +11,10 @@ class SymbolEntry:
         self.is_const      = is_const
         self.is_defined    = is_defined
         self.line          = line
-
-        # NIEUW in assignment 3
-        self.is_array   = is_array
-        # dimensions is altijd een lijst — nooit None na initialisatie
-        self.dimensions = dimensions if dimensions is not None else []
+        self.is_array      = is_array
+        self.dimensions    = dimensions if dimensions is not None else []
 
     def type_str(self) -> str:
-        """Geeft een leesbare type string terug voor in foutmeldingen."""
         const_str = "const " if self.is_const else ""
         stars     = "*" * self.pointer_depth
         if self.is_array:
@@ -49,12 +26,37 @@ class SymbolEntry:
         return f"SymbolEntry({self.name}: {self.type_str()})"
 
 
-class SymbolTable:
+class FunctionEntry:
     """
-    De symbol table houdt alle gedeclareerde variabelen bij, per scope.
-    Ongewijzigd van assignment 2 — alleen SymbolEntry is uitgebreid.
+    Één entry in de functie-tabel: alle info over één functie.
+    Assignment 5 nieuw.
+
+    Velden:
+      - name         : naam van de functie ('mul', 'main', 'foo')
+      - return_type  : tuple (base_type, pointer_depth) — bv. ('int', 0)
+      - params       : lijst van (base_type, pointer_depth) tuples per parameter
+      - is_defined   : True als er een body is (funcDef)
+      - is_declared  : True als er een forward declaration is (funcDecl)
     """
 
+    def __init__(self, name: str, return_type: tuple, params: list,
+                 is_defined: bool = False, is_declared: bool = False):
+        self.name        = name
+        self.return_type = return_type
+        self.params      = params
+        self.is_defined  = is_defined
+        self.is_declared = is_declared
+
+    def signature_str(self) -> str:
+        ret    = f"{'*' * self.return_type[1]}{self.return_type[0]}"
+        params = ', '.join(f"{'*' * d}{t}" for t, d in self.params)
+        return f"{ret} {self.name}({params})"
+
+    def __repr__(self):
+        return f"FunctionEntry({self.signature_str()})"
+
+
+class SymbolTable:
     def __init__(self):
         self.scopes = [{}]
 
@@ -80,3 +82,19 @@ class SymbolTable:
 
     def lookup_current_scope(self, name: str) -> SymbolEntry | None:
         return self.scopes[-1].get(name, None)
+
+
+class FunctionTable:
+    """Houdt alle gedeclareerde en gedefinieerde functies bij. Assignment 5 nieuw."""
+
+    def __init__(self):
+        self._functions: dict[str, FunctionEntry] = {}
+
+    def declare(self, entry: FunctionEntry):
+        self._functions[entry.name] = entry
+
+    def lookup(self, name: str) -> FunctionEntry | None:
+        return self._functions.get(name, None)
+
+    def all_functions(self) -> list:
+        return list(self._functions.values())

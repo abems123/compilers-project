@@ -8,11 +8,14 @@ from .ast_nodes import (
     CommentNode, ArrayDeclNode, ArrayInitNode,
     ArrayAccessNode, StringLiteralNode,
     FunctionCallNode, IncludeNode,
-    # Assignment 4 (nieuw):
+    # Assignment 4:
     EnumDefNode, IfNode, WhileNode,
-    BreakNode, ContinueNode, ScopeNode
+    BreakNode, ContinueNode, ScopeNode,
+    # Assignment 5 (nieuw):
+    ParamNode, FunctionDeclNode, FunctionDefNode,
+    ReturnNode, DefineNode, IncludeFileNode,
 )
-from .symbol_table import SymbolTable, SymbolEntry
+from .symbol_table import SymbolTable, SymbolEntry, FunctionTable, FunctionEntry
 
 
 # Type hiërarchie voor impliciete conversies (van arm naar rijk):
@@ -31,46 +34,43 @@ class SemanticAnalysisVisitor:
     """
     Loopt over de AST en controleert op semantische fouten en warnings.
 
-    Assignment 4 voegt toe:
-      - visitProgram   : verwerkt nu ook enums vóór de body
-      - visitEnumDef   : registreert labels als const int in de globale scope
-      - visitIf        : push/pop scope voor beide takken
-      - visitWhile     : push/pop scope voor body, bijhouden loop_depth
-      - visitBreak     : check of we in een lus of switch zitten
-      - visitContinue  : check of we in een lus zitten (NIET switch)
-      - visitScope     : push/pop scope voor anonieme blokken
-      - visitVarDecl   : uitgebreid: enum type check
-      - visitBlock     : ongewijzigd (push/pop scope zit in de callers)
+    Assignment 5 voegt toe:
+      - visitProgram      : iteratie over globals ipv vaste main-structuur
+      - visitFunctionDef  : registreer functie, check body, return type
+      - visitFunctionDecl : registreer forward declaration, check duplicaten
+      - visitReturn       : check return type vs omringende functie
+      - visitDefine       : no-op (preprocessor heeft al gedaan)
+      - visitIncludeFile  : no-op (preprocessor heeft al gedaan)
+      - visitFunctionCall : uitgebreid — check of functie bestaat + parameter types
+      - get_type          : uitgebreid — FunctionCallNode geeft juiste return type
 
-    SCOPE STRATEGIE:
-      - visitProgram opent de globale scope (push_scope)
-      - visitIf/visitWhile/visitScope openen elk een nieuwe scope (push/pop)
-      - visitBlock zelf doet GEEN push/pop meer — dat doen de callers.
-        Zo voorkomt je dat main() een dubbele scope krijgt.
+    FUNCTIE TRACKING:
+      - self.function_table    : FunctionTable — alle gedeclareerde/gedefinieerde functies
+      - self.current_function  : FunctionEntry | None — de functie die we nu bezoeken
+        Gebruikt door visitReturn om het verwachte return type te weten.
 
-    LOOP TRACKING:
-      - self.loop_depth  : int — hoe diep zitten we in lussen (while/for)?
-      - self.switch_depth: int — hoe diep zitten we in switch statements?
-      break  is geldig als loop_depth > 0 OF switch_depth > 0
-      continue is geldig als loop_depth > 0 (NIET in switch alleen)
-
-    ENUM TRACKING:
-      - self.enum_types: dict van enum-naam → lijst van labels
-        Zodat we bij 'enum Status x = BUSY' kunnen checken of BUSY geldig is.
-      - Enum labels worden als SymbolEntry met is_const=True in de
-        GLOBALE scope geregistreerd (scope index 0).
+    SCOPE STRATEGIE (ongewijzigd):
+      - Globale scope: geopend in visitProgram
+      - Per functie: nieuwe scope in visitFunctionDef
+      - Parameters worden in de functie-scope geregistreerd
+      - if/while/scope: eigen scope via push/pop (ongewijzigd)
     """
 
     def __init__(self):
-        self.symbol_table    = SymbolTable()
-        self.errors          = []
-        self.warnings        = []
+        self.symbol_table     = SymbolTable()
+        self.function_table   = FunctionTable()   # NIEUW
+        self.errors           = []
+        self.warnings         = []
         self.included_headers = set()
 
-        # NIEUW in assignment 4:
-        self.loop_depth   = 0   # teller voor while/for nesting
-        self.switch_depth = 0   # teller voor switch nesting
-        self.enum_types   = {}  # enum-naam → lijst van label-strings
+        # Assignment 4:
+        self.loop_depth   = 0
+        self.switch_depth = 0
+        self.enum_types   = {}
+
+        # Assignment 5 nieuw:
+        self.current_function: FunctionEntry | None = None  # welke functie bezoeken we nu?
+        self.current_global_index: int = 0  # index in globals van de functie die we nu bezoeken
 
     # --------------------------------------------------------
     # Fout- en waarschuwingsrapportage (ongewijzigd)
@@ -153,7 +153,11 @@ class SemanticAnalysisVisitor:
             return (node.target_type.base_type, node.target_type.pointer_depth)
 
         elif isinstance(node, FunctionCallNode):
-            return ('int', 0)
+            # Assignment 5: zoek het echte return type op in de function_table
+            func_entry = self.function_table.lookup(node.name)
+            if func_entry is not None:
+                return func_entry.return_type
+            return ('int', 0)  # fallback voor onbekende functies (bv. printf)
 
         return ('unknown', 0)
 
@@ -180,31 +184,284 @@ class SemanticAnalysisVisitor:
 
     def visitProgram(self, node):
         """
-        NIEUW in assignment 4: verwerk enums vóór includes en body,
-        zodat enum labels als geldige const int variabelen beschikbaar
-        zijn voor de rest van de analyse.
+        Assignment 5: itereer over globals in volgorde.
 
-        Volgorde:
-          1. Open globale scope
-          2. Verwerk includes (bepaal stdio_included)
-          3. Verwerk enum definities (registreer labels in globale scope)
-          4. Verwerk de body van main()
-          5. Sluit globale scope
+        Twee passes:
+          Pass 1 — registreer alle functies (decl + def) zodat forward
+                   declarations altijd gevonden worden, ook al staan ze
+                   na de aanroep (voor mutual recursion).
+          Pass 2 — bezoek de bodies van alle functies + globale variabelen.
+
+        Na afloop: check dat main() bestaat.
         """
         self.symbol_table.push_scope()
 
-        # includes
-        for inc in node.includes:
-            inc.accept(self)
+        # ── Pass 1: registreer alle functies ──────────────────────────────
+        # Bijhouden op welke positie (index) elke functie voor het eerst
+        # verschijnt, zodat we "aanroep vóór declaratie" kunnen detecteren.
+        self.func_global_index = {}  # functienaam → index in globals
 
-        # NIEUW: enum definities
-        for enum_node in node.enums:
-            enum_node.accept(self)
+        for i, item in enumerate(node.globals):
+            if isinstance(item, FunctionDeclNode):
+                if item.name not in self.func_global_index:
+                    self.func_global_index[item.name] = i
+                self._register_func_decl(item)
+            elif isinstance(item, FunctionDefNode):
+                if item.name not in self.func_global_index:
+                    self.func_global_index[item.name] = i
+                self._register_func_def(item)
+            elif isinstance(item, EnumDefNode):
+                item.accept(self)
+            elif isinstance(item, IncludeNode):
+                item.accept(self)
+            elif isinstance(item, IncludeFileNode):
+                pass
 
-        # body van main (geen extra push_scope hier — de body is al in de globale scope)
+        # ── Pass 2: bezoek bodies en globale variabelen ───────────────────
+        for i, item in enumerate(node.globals):
+            if isinstance(item, FunctionDefNode):
+                self.current_global_index = i
+                item.accept(self)
+            elif isinstance(item, VarDeclNode):
+                item.accept(self)
+
+        # ── Check: main() moet aanwezig zijn ──────────────────────────────
+        main_entry = self.function_table.lookup('main')
+        if main_entry is None or not main_entry.is_defined:
+            self.error("Functie 'main' ontbreekt. Elk C programma moet een main() hebben.")
+
+        # ── Check: elke forward declaration moet een definitie hebben ──────
+        for func in self.function_table.all_functions():
+            if func.is_declared and not func.is_defined:
+                self.error(
+                    f"Forward declaration van '{func.name}' heeft geen bijbehorende definitie."
+                )
+
+        self.symbol_table.pop_scope()
+
+    # --------------------------------------------------------
+    # Hulpmethoden voor functie registratie
+    # --------------------------------------------------------
+
+    def _type_node_to_tuple(self, type_node: TypeNode) -> tuple:
+        """Zet een TypeNode om naar een (base_type, pointer_depth) tuple."""
+        return (type_node.base_type, type_node.pointer_depth)
+
+    def _params_to_tuples(self, params: list) -> list:
+        """Zet een lijst ParamNodes om naar [(base_type, pointer_depth), ...]"""
+        return [self._type_node_to_tuple(p.param_type) for p in params]
+
+    def _register_func_decl(self, node: FunctionDeclNode):
+        """
+        Registreer een forward declaration.
+
+        EDGE CASE: al eerder gedeclareerd → check dat signatures overeenkomen.
+        EDGE CASE: al eerder gedefinieerd → check dat signatures overeenkomen.
+        EDGE CASE: definitie komt VÓÓR forward declaration in broncode →
+          dit is een warning in C, bij ons een error.
+        """
+        ret   = self._type_node_to_tuple(node.return_type)
+        params = self._params_to_tuples(node.params)
+
+        existing = self.function_table.lookup(node.name)
+        if existing is not None:
+            # check consistentie
+            self._check_signature_match(existing, ret, params, node.name, "declaratie")
+            existing.is_declared = True
+        else:
+            entry = FunctionEntry(
+                name        = node.name,
+                return_type = ret,
+                params      = params,
+                is_defined  = False,
+                is_declared = True,
+            )
+            self.function_table.declare(entry)
+
+    def _register_func_def(self, node: FunctionDefNode):
+        """
+        Registreer een functiedefinitie (zonder de body te bezoeken).
+
+        EDGE CASE: al eerder gedefinieerd → redefinitie error.
+        EDGE CASE: al eerder gedeclareerd → check dat signatures overeenkomen.
+        """
+        ret    = self._type_node_to_tuple(node.return_type)
+        params = self._params_to_tuples(node.params)
+
+        existing = self.function_table.lookup(node.name)
+        if existing is not None:
+            if existing.is_defined:
+                self.error(f"Herdefiniëring van functie '{node.name}'.")
+                return
+            # forward declaration aanwezig: check consistentie
+            self._check_signature_match(existing, ret, params, node.name, "definitie")
+            existing.is_defined  = True
+            existing.return_type = ret
+            existing.params      = params
+        else:
+            entry = FunctionEntry(
+                name        = node.name,
+                return_type = ret,
+                params      = params,
+                is_defined  = True,
+                is_declared = False,
+            )
+            self.function_table.declare(entry)
+
+    def _check_signature_match(self, existing: FunctionEntry,
+                                ret: tuple, params: list,
+                                name: str, context: str):
+        """
+        Check of een nieuwe declaratie/definitie overeenkomt met een
+        bestaande forward declaration of definitie.
+        """
+        if existing.return_type != ret:
+            self.error(
+                f"Inconsistent return type voor '{name}' in {context}: "
+                f"verwacht '{existing.return_type[0]}', gevonden '{ret[0]}'."
+            )
+        if len(existing.params) != len(params):
+            self.error(
+                f"Inconsistent aantal parameters voor '{name}' in {context}: "
+                f"verwacht {len(existing.params)}, gevonden {len(params)}."
+            )
+        else:
+            for i, (exp, got) in enumerate(zip(existing.params, params)):
+                if exp != got:
+                    self.error(
+                        f"Parameter {i+1} van '{name}' in {context}: "
+                        f"type mismatch — verwacht '{exp[0]}{'*'*exp[1]}', "
+                        f"gevonden '{got[0]}{'*'*got[1]}'."
+                    )
+
+    # --------------------------------------------------------
+    # Assignment 5: FUNCTIE DEFINITIE
+    # --------------------------------------------------------
+
+    def visitFunctionDef(self, node: FunctionDefNode):
+        """
+        Bezoek de body van een functiedefinitie.
+
+        Stappen:
+          1. Haal de FunctionEntry op uit de function_table (al geregistreerd)
+          2. Sla current_function op zodat visitReturn het return type kent
+          3. Open een nieuwe scope voor de functie
+          4. Registreer parameters als lokale variabelen
+          5. Bezoek de body
+          6. Herstel current_function en pop_scope
+
+        EDGE CASE: twee parameters met dezelfde naam → redeclaratie error.
+        EDGE CASE: parameter heeft dezelfde naam als globale variabele →
+          shadowing, de lokale parameter wint (geen error, wel geldige C).
+        EDGE CASE: recursieve aanroep → de functie staat al in function_table
+          (geregistreerd in pass 1), dus FunctionCallNode vindt hem.
+        """
+        entry = self.function_table.lookup(node.name)
+        if entry is None:
+            return  # zou niet mogen na pass 1
+
+        prev_function = self.current_function
+        self.current_function = entry
+
+        self.symbol_table.push_scope()
+
+        # registreer parameters als lokale variabelen
+        for param in node.params:
+            existing = self.symbol_table.lookup_current_scope(param.name)
+            if existing is not None:
+                self.error(
+                    f"Parameter '{param.name}' van functie '{node.name}' "
+                    f"is dubbel gedeclareerd."
+                )
+            else:
+                sym = SymbolEntry(
+                    name          = param.name,
+                    base_type     = param.param_type.base_type,
+                    pointer_depth = param.param_type.pointer_depth,
+                    is_const      = param.param_type.is_const,
+                    is_defined    = True,
+                )
+                self.symbol_table.declare(sym)
+
+        # bezoek de body
         node.body.accept(self)
 
         self.symbol_table.pop_scope()
+        self.current_function = prev_function
+
+    def visitFunctionDecl(self, node: FunctionDeclNode):
+        """Forward declarations zijn al verwerkt in pass 1 — no-op hier."""
+        pass
+
+    # --------------------------------------------------------
+    # Assignment 5: RETURN STATEMENT
+    # --------------------------------------------------------
+
+    def visitReturn(self, node: ReturnNode):
+        """
+        Checks:
+          1. Return buiten een functie → error
+          2. Return met waarde in void functie → error
+          3. Return zonder waarde in non-void functie → warning
+          4. Return type mismatch → warning
+
+        EDGE CASE: return; in void functie → geldig.
+        EDGE CASE: return 0; in main() → geldig (int return type).
+        EDGE CASE: return in geneste if/while → springt altijd uit de functie.
+        """
+        # check 1: buiten functie?
+        if self.current_function is None:
+            self.error("'return' gebruikt buiten een functie.")
+            return
+
+        ret_base, ret_depth = self.current_function.return_type
+
+        if node.value is None:
+            # return; — alleen geldig in void functies
+            if ret_base != 'void':
+                self.error(
+                    f"Functie '{self.current_function.name}' heeft return type "
+                    f"'{ret_base}' maar gebruikt 'return;' zonder waarde."
+                )
+        else:
+            # return <expr>;
+            node.value.accept(self)
+
+            if ret_base == 'void':
+                self.error(
+                    f"Void functie '{self.current_function.name}' "
+                    f"mag geen waarde teruggeven."
+                )
+            else:
+                # type check
+                val_base, val_depth = self.get_type(node.value)
+                if val_base != 'unknown':
+                    # pointer depth mismatch → altijd een error (int vs float* zijn onverenigbaar)
+                    if val_depth != ret_depth:
+                        self.error(
+                            f"Return type mismatch in '{self.current_function.name}': "
+                            f"functie verwacht '{ret_base}{'*'*ret_depth}', "
+                            f"maar geeft '{val_base}{'*'*val_depth}' terug."
+                        )
+                    elif val_base in TYPE_RANK and ret_base in TYPE_RANK:
+                        if TYPE_RANK[val_base] > TYPE_RANK[ret_base]:
+                            self.warning(
+                                f"Return type mismatch in '{self.current_function.name}': "
+                                f"functie verwacht '{ret_base}', "
+                                f"maar geeft '{val_base}' terug (mogelijk precisieverlies)."
+                            )
+
+    # --------------------------------------------------------
+    # Assignment 5: DEFINE / INCLUDE FILE
+    # --------------------------------------------------------
+
+    def visitDefine(self, node: DefineNode):
+        """Preprocessor heeft defines al verwerkt — no-op."""
+        pass
+
+    def visitIncludeFile(self, node: IncludeFileNode):
+        """Preprocessor heeft includes al ingeladen — no-op."""
+        pass
 
     def visitInclude(self, node):
         self.included_headers.add(node.header)
@@ -598,15 +855,78 @@ class SemanticAnalysisVisitor:
     def visitType(self, node):
         pass
 
-    def visitFunctionCall(self, node):
-        """Ongewijzigd van assignment 3."""
+    def visitFunctionCall(self, node: FunctionCallNode):
+        """
+        Assignment 5: uitgebreid met volledige functie-checks.
+
+        Checks:
+          1. printf/scanf: stdio.h check (ongewijzigd)
+          2. Overige functies: bestaat de functie?
+          3. Correct aantal argumenten?
+          4. Correct type per argument?
+
+        EDGE CASE: printf/scanf hebben variabel aantal argumenten →
+          we checken alleen dat stdio.h geïncludeerd is.
+        EDGE CASE: functie aanroepen vóór declaratie → in pass 1 zijn alle
+          functies al geregistreerd, dus dit werkt voor functies in hetzelfde
+          bestand. Voor functies uit headers: ook opgelost door pass 1.
+        EDGE CASE: recursieve aanroep → functie staat al in function_table.
+        """
+        # altijd de argumenten bezoeken
+        for arg in node.args:
+            arg.accept(self)
+
+        # printf / scanf: alleen stdio check
         if node.name in ('printf', 'scanf'):
             if 'stdio.h' not in self.included_headers:
                 self.error(
                     f"Functie '{node.name}' gebruikt zonder #include <stdio.h>."
                 )
-        for arg in node.args:
-            arg.accept(self)
+            return  # geen verdere checks voor variadische functies
 
-    def visitInclude(self, node):
-        self.included_headers.add(node.header)
+        # zoek de functie op in de function_table
+        func_entry = self.function_table.lookup(node.name)
+        if func_entry is None:
+            self.error(
+                f"Aanroep van onbekende functie '{node.name}'. "
+                f"Is de functie gedeclareerd of gedefinieerd?"
+            )
+            return
+
+        # check: is de functie gedeclareerd/gedefinieerd VOOR de huidige aanroep?
+        # Recursieve aanroepen zijn altijd geldig (zelfde index).
+        func_pos = self.func_global_index.get(node.name, -1)
+        if func_pos > self.current_global_index:
+            self.error(
+                f"Functie '{node.name}' wordt aangeroepen vóór de declaratie of definitie."
+            )
+
+        # check aantal argumenten
+        expected = len(func_entry.params)
+        actual   = len(node.args)
+        if expected != actual:
+            self.error(
+                f"Functie '{node.name}' verwacht {expected} argument(en), "
+                f"maar er worden {actual} meegegeven."
+            )
+            return
+
+        # check types per argument
+        for i, (arg, (exp_type, exp_depth)) in enumerate(zip(node.args, func_entry.params)):
+            arg_type, arg_depth = self.get_type(arg)
+            if arg_type == 'unknown':
+                continue  # kan niet checken, al eerder een error gegeven
+            if arg_depth != exp_depth:
+                self.warning(
+                    f"Argument {i+1} van '{node.name}': "
+                    f"pointer diepte mismatch — "
+                    f"verwacht {'*'*exp_depth}{exp_type}, "
+                    f"gevonden {'*'*arg_depth}{arg_type}."
+                )
+            elif arg_type in TYPE_RANK and exp_type in TYPE_RANK:
+                if TYPE_RANK[arg_type] > TYPE_RANK[exp_type]:
+                    self.warning(
+                        f"Argument {i+1} van '{node.name}': "
+                        f"mogelijk precisieverlies — "
+                        f"{arg_type} naar {exp_type}."
+                    )

@@ -1,6 +1,6 @@
 // Elke grammar file moet beginnen met de naam.
 // De naam moet exact overeenkomen met de bestandsnaam!
-grammar MyGrammar;
+grammar assignment_5;
 
 // --------------------
 // Parser rules
@@ -356,15 +356,6 @@ expression
     | expression PLUSPLUS                       // suffix ++:        x++
     | expression MINUSMINUS                     // suffix --:        x--
     | functionCall                              // functie aanroep:  printf(...)
-    | MINUS      expression                     // unaire min        (hogere prio dan binaire *)
-    | PLUS       expression                     // unaire plus
-    | EXMARK     expression                     // logische NOT
-    | TILDE      expression                     // bitwise NOT
-    | AND        expression                     // address-of: &x
-    | STAR       expression                     // pointer deref: *ptr
-    | PLUSPLUS   expression                     // prefix ++
-    | MINUSMINUS expression                     // prefix --
-    | LPAREN type RPAREN expression             // cast: (int) x
     | expression STAR        expression         // vermenigvuldiging
     | expression SLASH       expression         // deling
     | expression PERCENT     expression         // modulo
@@ -383,6 +374,15 @@ expression
     | expression OR          expression         // bitwise OR
     | expression ANDAND      expression         // logische AND
     | expression OROR        expression         // logische OR
+    | MINUS      expression                     // unaire min
+    | PLUS       expression                     // unaire plus
+    | EXMARK     expression                     // logische NOT
+    | TILDE      expression                     // bitwise NOT
+    | AND        expression                     // address-of: &x
+    | STAR       expression                     // pointer deref: *ptr
+    | PLUSPLUS   expression                     // prefix ++
+    | MINUSMINUS expression                     // prefix --
+    | LPAREN type RPAREN expression             // cast: (int) x
     | LPAREN expression RPAREN                  // haakjes: (3 + 4)
     | INTEGER                                   // integer literal: 42
     | FLOAT                                     // float literal: 3.14

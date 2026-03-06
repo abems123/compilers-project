@@ -76,25 +76,17 @@ class ASTDotVisitor:
 
     def visitProgram(self, node):
         """
-        ProgramNode: de root van de AST.
+        ProgramNode (assignment 5): toont alle globals in volgorde.
 
-        NIEUW: toont nu ook de includes als kinderen vóór de body.
-
-        DOT voorbeeld voor programma met #include <stdio.h>:
-          n1 [label="Program (main)"];
-          n1 -- n2 [label="include[0]"];
-          n1 -- n3 [label="body"];
+        Elk global item (include, define, enum, funcDecl, funcDef, varDecl)
+        wordt als genummerd kind getoond met een edge-label die het type aangeeft.
         """
         my_id = self.new_id()
-        self.create_node(my_id, "Program (main)")
+        self.create_node(my_id, "Program")
 
-        # NIEUW: includes als kinderen (kan leeg zijn → loop doet niets)
-        for i, inc in enumerate(node.includes):
-            inc_id = inc.accept(self)
-            self.create_edge(my_id, inc_id, f"include[{i}]")
-
-        body_id = node.body.accept(self)
-        self.create_edge(my_id, body_id, "body")
+        for i, item in enumerate(node.globals):
+            item_id = item.accept(self)
+            self.create_edge(my_id, item_id, f"[{i}]")
 
         return my_id
 
@@ -425,4 +417,146 @@ class ASTDotVisitor:
         suffix  = "..." if len(node.text) > 30 else ""
 
         self.create_node(my_id, f"Comment: {preview}{suffix}")
+        return my_id
+
+    # ============================================================
+    # ASSIGNMENT 4 — ENUM, CONTROL FLOW, SCOPE
+    # ============================================================
+
+    def visitEnumDef(self, node):
+        """enum Status { READY, BUSY } → labels als kommalijst in het label."""
+        my_id = self.new_id()
+        labels_str = ', '.join(node.labels)
+        self.create_node(my_id, f"EnumDef: {node.name}\n{{{labels_str}}}")
+        return my_id
+
+    def visitIf(self, node):
+        my_id = self.new_id()
+        self.create_node(my_id, "If")
+
+        cond_id = node.condition.accept(self)
+        self.create_edge(my_id, cond_id, "condition")
+
+        then_id = node.then_block.accept(self)
+        self.create_edge(my_id, then_id, "then")
+
+        if node.else_block is not None:
+            else_id = node.else_block.accept(self)
+            self.create_edge(my_id, else_id, "else")
+
+        return my_id
+
+    def visitWhile(self, node):
+        my_id = self.new_id()
+        self.create_node(my_id, "While")
+
+        cond_id = node.condition.accept(self)
+        self.create_edge(my_id, cond_id, "condition")
+
+        body_id = node.body.accept(self)
+        self.create_edge(my_id, body_id, "body")
+
+        return my_id
+
+    def visitBreak(self, node):
+        my_id = self.new_id()
+        self.create_node(my_id, "Break")
+        return my_id
+
+    def visitContinue(self, node):
+        my_id = self.new_id()
+        self.create_node(my_id, "Continue")
+        return my_id
+
+    def visitScope(self, node):
+        my_id = self.new_id()
+        self.create_node(my_id, "Scope")
+        body_id = node.body.accept(self)
+        self.create_edge(my_id, body_id, "body")
+        return my_id
+
+    # ============================================================
+    # ASSIGNMENT 5 — PREPROCESSOR NODES
+    # ============================================================
+
+    def visitIncludeFile(self, node):
+        """#include "pad/naar/file.h" → blad node."""
+        my_id = self.new_id()
+        self.create_node(my_id, f'#include "{node.path}"')
+        return my_id
+
+    def visitDefine(self, node):
+        """#define naam waarde → blad node met naam en waarde."""
+        my_id = self.new_id()
+        value_str = f" = {node.value}" if node.value else ""
+        self.create_node(my_id, f"#define {node.name}{value_str}")
+        return my_id
+
+    # ============================================================
+    # ASSIGNMENT 5 — FUNCTIE NODES
+    # ============================================================
+
+    def visitParam(self, node):
+        """Één parameter: type + naam als blad node."""
+        my_id = self.new_id()
+        const_str = "const " if node.param_type.is_const else ""
+        stars     = "*" * node.param_type.pointer_depth
+        self.create_node(my_id, f"Param: {const_str}{node.param_type.base_type}{stars} {node.name}")
+        return my_id
+
+    def visitFunctionDecl(self, node):
+        """
+        Forward declaration: return type + naam + parameters.
+
+        DOT voorbeeld voor  int mul(int x, int y); :
+          n5 [label="FuncDecl: int mul"];
+          n5 -- n6 [label="param[0]"];
+          n5 -- n7 [label="param[1]"];
+        """
+        my_id = self.new_id()
+        ret_str = f"{node.return_type.base_type}{'*' * node.return_type.pointer_depth}"
+        self.create_node(my_id, f"FuncDecl: {ret_str} {node.name}")
+
+        for i, param in enumerate(node.params):
+            param_id = param.accept(self)
+            self.create_edge(my_id, param_id, f"param[{i}]")
+
+        return my_id
+
+    def visitFunctionDef(self, node):
+        """
+        Functiedefinitie: return type + naam + parameters + body.
+
+        DOT voorbeeld voor  int mul(int x, int y) { ... } :
+          n5 [label="FuncDef: int mul"];
+          n5 -- n6 [label="param[0]"];
+          n5 -- n7 [label="param[1]"];
+          n5 -- n8 [label="body"];
+        """
+        my_id = self.new_id()
+        ret_str = f"{node.return_type.base_type}{'*' * node.return_type.pointer_depth}"
+        self.create_node(my_id, f"FuncDef: {ret_str} {node.name}")
+
+        for i, param in enumerate(node.params):
+            param_id = param.accept(self)
+            self.create_edge(my_id, param_id, f"param[{i}]")
+
+        body_id = node.body.accept(self)
+        self.create_edge(my_id, body_id, "body")
+
+        return my_id
+
+    def visitReturn(self, node):
+        """
+        Return statement.
+          return x + 1; → ReturnNode met waarde als kind
+          return;       → blad node
+        """
+        my_id = self.new_id()
+        self.create_node(my_id, "Return")
+
+        if node.value is not None:
+            val_id = node.value.accept(self)
+            self.create_edge(my_id, val_id, "value")
+
         return my_id

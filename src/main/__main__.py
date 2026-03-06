@@ -3,13 +3,15 @@
 import argparse
 from pathlib import Path
 
-from antlr4 import FileStream, CommonTokenStream
+from antlr4 import InputStream, CommonTokenStream
 
 from .gen.MyGrammarLexer   import MyGrammarLexer
 from .gen.MyGrammarParser  import MyGrammarParser
 
+from ..parser.preprocessor               import Preprocessor
 from ..parser.ast_visitor                import CSTtoASTVisitor
 from ..parser.constant_folding_visitor   import ConstantFoldingVisitor
+from ..parser.dead_code_visitor          import DeadCodeVisitor
 from ..parser.ast_dot_visitor            import ASTDotVisitor
 from ..parser.semantic_analysis_visitor  import SemanticAnalysisVisitor
 from ..llvm_target.llvm_visitor          import LLVMVisitor
@@ -21,7 +23,7 @@ def main():
     # Stap 1: command line argumenten
     # --------------------------------------------------------
     arg_parser = argparse.ArgumentParser(
-        description="Assignment 3 compiler: comments, arrays, I/O, LLVM IR"
+        description="Assignment 5 compiler: functies, headers, LLVM IR"
     )
     arg_parser.add_argument("--input",       required=True,
                             help="Pad naar het input bestand (C broncode)")
@@ -34,10 +36,22 @@ def main():
 
     args = arg_parser.parse_args()
 
+    input_path = Path(args.input).resolve()
+
     # --------------------------------------------------------
-    # Stap 2: parse → CST
+    # Stap 2: preprocessor (#include + #define)
     # --------------------------------------------------------
-    source = FileStream(args.input, encoding="utf-8")
+    preprocessor = Preprocessor(base_dir=input_path.parent)
+    preprocessed_source = preprocessor.process(input_path)
+
+    if preprocessor.has_errors():
+        preprocessor.print_errors()
+        return
+
+    # --------------------------------------------------------
+    # Stap 3: parse → CST (nu op de preprocessed source string)
+    # --------------------------------------------------------
+    source = InputStream(preprocessed_source)
     lexer  = MyGrammarLexer(source)
     tokens = CommonTokenStream(lexer)
     parser = MyGrammarParser(tokens)
@@ -48,20 +62,19 @@ def main():
         return
 
     # --------------------------------------------------------
-    # Stap 3: CST → AST
+    # Stap 4: CST → AST
     # --------------------------------------------------------
     ast_visitor = CSTtoASTVisitor()
     ast = ast_visitor.visit(cst)
 
     # check voor fouten gevonden tijdens CST→AST vertaling
-    # (bv. variabele declaratie direct in switch zonder anonieme scope)
     if ast_visitor.errors:
         for e in ast_visitor.errors:
             print(e)
         return
 
     # --------------------------------------------------------
-    # Stap 4: semantische analyse
+    # Stap 5: semantische analyse
     # --------------------------------------------------------
     semantic = SemanticAnalysisVisitor()
     ast.accept(semantic)
@@ -71,19 +84,24 @@ def main():
         return
 
     # --------------------------------------------------------
-    # Stap 5: constant folding + propagation (optioneel)
+    # Stap 6: constant folding + propagation (optioneel)
     # --------------------------------------------------------
     if not args.no_folding:
         ast = ast.accept(ConstantFoldingVisitor())
 
     # --------------------------------------------------------
-    # Stap 6: print AST (voor debugging)
+    # Stap 7: dead code eliminatie (altijd aan)
+    # --------------------------------------------------------
+    ast = ast.accept(DeadCodeVisitor())
+
+    # --------------------------------------------------------
+    # Stap 8: print AST (voor debugging)
     # --------------------------------------------------------
     print("\nAST:")
     print(f"  {ast}")
 
     # --------------------------------------------------------
-    # Stap 7: render AST als .dot bestand (optioneel)
+    # Stap 9: render AST als .dot bestand (optioneel)
     # --------------------------------------------------------
     if args.render_ast:
         dot = ASTDotVisitor()
@@ -96,7 +114,7 @@ def main():
         print(f"\nAST DOT geschreven naar: {args.render_ast}")
 
     # --------------------------------------------------------
-    # Stap 8: LLVM IR genereren (optioneel)
+    # Stap 10: LLVM IR genereren (optioneel)
     # --------------------------------------------------------
     if args.output_llvm:
         llvm = LLVMVisitor()

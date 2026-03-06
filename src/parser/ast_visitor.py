@@ -9,9 +9,12 @@ from .ast_nodes import (
     CommentNode, ArrayDeclNode, ArrayInitNode,
     ArrayAccessNode, StringLiteralNode,
     FunctionCallNode, IncludeNode,
-    # Assignment 4 (nieuw):
+    # Assignment 4:
     EnumDefNode, IfNode, WhileNode,
-    BreakNode, ContinueNode, ScopeNode
+    BreakNode, ContinueNode, ScopeNode,
+    # Assignment 5 (nieuw):
+    ParamNode, FunctionDeclNode, FunctionDefNode,
+    ReturnNode, DefineNode, IncludeFileNode,
 )
 
 
@@ -22,84 +25,196 @@ class CSTtoASTVisitor(ParseTreeVisitor):
     Elke methode hier komt overeen met één grammar regel.
     Naamconventie: visit + (naam van de grammar regel met hoofdletter).
 
-    Assignment 4 voegt toe:
-      - visitProgram     : leest nu ook de enumDef* kinderen vóór main
-      - visitStatement   : herkent if, while, for, break, continue, switch, scope
-      - visitEnumDef     : enum definitie → EnumDefNode
-      - visitIfStmt      : if/else/else-if → IfNode
-      - visitWhileStmt   : while → WhileNode
-      - visitForStmt     : for → VarDecl/Assign + WhileNode (vertaling!)
-      - visitBreakStmt   : break → BreakNode
-      - visitContinueStmt: continue → ContinueNode
-      - visitSwitchStmt  : switch → IfNode keten (vertaling!)
-      - visitScopeStmt   : anonieme scope → ScopeNode
-      - visitType        : uitgebreid met enum type
+    Assignment 5 voegt toe:
+      - visitProgram      : nu globalItem* in plaats van hardcoded main
+      - visitGlobalItem   : dispatcht naar funcDef/funcDecl/varDec/...
+      - visitFuncDef      : functiedefinitie → FunctionDefNode
+      - visitFuncDecl     : forward declaration → FunctionDeclNode
+      - visitReturnType   : void of een gewoon type → TypeNode
+      - visitParamList    : lijst van params → [ParamNode, ...]
+      - visitParam        : één parameter → ParamNode
+      - visitReturnStmt   : return statement → ReturnNode
+      - visitDefineStmt   : #define → DefineNode
+      - visitIncludeStmt  : uitgebreid met #include "file.h"
+      - visitStatement    : uitgebreid met returnStmt
     """
 
     def __init__(self):
         self.errors = []
 
     # --------------------------------------------------------
-    # visitProgram
+    # visitProgram (volledig herschreven voor assignment 5)
     # --------------------------------------------------------
-    # Grammar: program : (includeStmt | comment | enumDef)* INT_KW MAIN ... block EOF
+    # Grammar: program : globalItem* EOF
     #
-    # NIEUW in assignment 4: enumDef* kinderen vóór main worden verzameld
-    # en apart opgeslagen in ProgramNode.enums.
+    # We itereren over alle globalItems in volgorde en bewaren ze
+    # in ProgramNode.globals. De semantic analysis verwerkt ze
+    # later van boven naar beneden.
     #
-    # EDGE CASE: ctx.enumDef() geeft een lege lijst als er geen enums zijn.
-    # EDGE CASE: de volgorde van includes/comments/enums in de broncode
-    # is niet relevant voor de compiler — we bewaren ze apart per type.
+    # EDGE CASE: lege programma (alleen EOF) → globals = []
+    # EDGE CASE: main() is nu gewoon een FunctionDefNode
     def visitProgram(self, ctx):
-        # verzamel includes
-        includes = []
-        for inc_ctx in ctx.includeStmt():
-            includes.append(self.visit(inc_ctx))
-
-        # verzamel top-level comments
-        top_comments = []
-        for cmt_ctx in ctx.comment():
-            top_comments.append(self.visit(cmt_ctx))
-
-        # NIEUW: verzamel enum definities
-        enums = []
-        for enum_ctx in ctx.enumDef():
-            enums.append(self.visit(enum_ctx))
-
-        # bezoek de block (body van main)
-        block = self.visit(ctx.block())
-
-        # top-level comments aan het begin van de block statements
-        if top_comments:
-            block.statements = top_comments + block.statements
-
-        return ProgramNode(block, includes, enums)
+        globals_list = []
+        for item_ctx in ctx.globalItem():
+            node = self.visit(item_ctx)
+            if node is not None:
+                globals_list.append(node)
+        return ProgramNode(globals_list)
 
     # --------------------------------------------------------
-    # visitEnumDef (NIEUW)
+    # visitGlobalItem (NIEUW)
     # --------------------------------------------------------
-    # Grammar: enumDef : ENUM_KW ID LBRACE ID (COMMA ID)* RBRACE SC
+    # Grammar: globalItem : includeStmt | defineStmt | enumDef
+    #                     | funcDef | funcDecl | varDec | comment
     #
-    # De eerste ID is de naam van de enum (bv. 'Status').
-    # Alle overige IDs zijn de labels (bv. ['READY', 'BUSY', 'OFFLINE']).
-    #
-    # EDGE CASE: ctx.ID() geeft een LIJST van alle ID-tokens terug.
-    # Het EERSTE element is de enum naam, de REST zijn de labels.
-    def visitEnumDef(self, ctx):
-        all_ids = ctx.ID()                      # lijst van alle ID tokens
-        name    = all_ids[0].getText()          # eerste ID = enum naam
-        labels  = [id_.getText() for id_ in all_ids[1:]]  # rest = labels
-        return EnumDefNode(name, labels)
+    # Dispatcht naar de juiste visitor methode op basis van
+    # welk alternatief ANTLR herkend heeft.
+    def visitGlobalItem(self, ctx):
+        if ctx.includeStmt():
+            return self.visit(ctx.includeStmt())
+        if ctx.defineStmt():
+            return self.visit(ctx.defineStmt())
+        if ctx.enumDef():
+            return self.visit(ctx.enumDef())
+        if ctx.funcDef():
+            return self.visit(ctx.funcDef())
+        if ctx.funcDecl():
+            return self.visit(ctx.funcDecl())
+        if ctx.varDec():
+            return self.visit(ctx.varDec())
+        if ctx.comment():
+            return self.visit(ctx.comment())
+        return None
 
     # --------------------------------------------------------
-    # visitIncludeStmt (ongewijzigd van assignment 3)
+    # visitIncludeStmt (uitgebreid voor assignment 5)
     # --------------------------------------------------------
+    # Grammar: includeStmt : INCLUDE_STDIO | INCLUDE_FILE
+    #
+    # INCLUDE_STDIO → IncludeNode('stdio.h')
+    # INCLUDE_FILE  → IncludeFileNode('pad/naar/file.h')
+    #
+    # EDGE CASE: INCLUDE_FILE bevat aanhalingstekens in de token tekst.
+    # We strippen die eraf om alleen het pad te bewaren.
     def visitIncludeStmt(self, ctx):
-        token_text = ctx.INCLUDE_STDIO().getText()
-        start  = token_text.index('<') + 1
-        end    = token_text.index('>')
-        header = token_text[start:end]
-        return IncludeNode(header)
+        if ctx.INCLUDE_STDIO():
+            token_text = ctx.INCLUDE_STDIO().getText()
+            start  = token_text.index('<') + 1
+            end    = token_text.index('>')
+            header = token_text[start:end]
+            return IncludeNode(header)
+        else:
+            # INCLUDE_FILE: '#include "pad/naar/file.h"'
+            token_text = ctx.INCLUDE_FILE().getText()
+            start = token_text.index('"') + 1
+            end   = token_text.rindex('"')
+            path  = token_text[start:end]
+            return IncludeFileNode(path)
+
+    # --------------------------------------------------------
+    # visitDefineStmt (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: defineStmt : DEFINE_STMT
+    #
+    # DEFINE_STMT is één token: '#define bool int'
+    # We parsen de naam en waarde eruit met een simpele split.
+    #
+    # EDGE CASE: '#define GUARD' zonder waarde → value = ''
+    # EDGE CASE: '#define MAX 100' → name='MAX', value='100'
+    def visitDefineStmt(self, ctx):
+        token_text = ctx.DEFINE_STMT().getText().strip()
+        # Verwijder '#define ' prefix
+        # formaat: '#define<whitespace>naam<whitespace>waarde'
+        import re
+        match = re.match(r'#\s*define\s+(\w+)(?:\s+(.*))?$', token_text)
+        if match:
+            name  = match.group(1)
+            value = (match.group(2) or '').strip()
+        else:
+            name  = token_text
+            value = ''
+        return DefineNode(name, value)
+
+    # --------------------------------------------------------
+    # visitFuncDef (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: funcDef : returnType ID LPAREN paramList RPAREN block
+    #
+    # Voorbeeld: int mul(int x, int y) { return x * y; }
+    #
+    # EDGE CASE: lege parameterlijst → params = []
+    # EDGE CASE: void return type → TypeNode('void')
+    # EDGE CASE: recursieve functie → body bevat FunctionCallNode
+    #   met dezelfde naam. Dit is gewoon een node in de body.
+    def visitFuncDef(self, ctx):
+        return_type = self.visit(ctx.returnType())
+        name        = ctx.ID().getText()
+        params      = self.visit(ctx.paramList())
+        body        = self.visit(ctx.block())
+        return FunctionDefNode(return_type, name, params, body)
+
+    # --------------------------------------------------------
+    # visitFuncDecl (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: funcDecl : returnType ID LPAREN paramList RPAREN SC
+    #
+    # Voorbeeld: int mul(int x, int y);
+    #
+    # EDGE CASE: forward declaration in header file → werkt gewoon,
+    #   de preprocessor heeft de header al ingeladen.
+    def visitFuncDecl(self, ctx):
+        return_type = self.visit(ctx.returnType())
+        name        = ctx.ID().getText()
+        params      = self.visit(ctx.paramList())
+        return FunctionDeclNode(return_type, name, params)
+
+    # --------------------------------------------------------
+    # visitReturnType (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: returnType : VOID_KW | type
+    #
+    # VOID_KW → TypeNode('void')
+    # type    → bestaand TypeNode (int, float, char, pointer, ...)
+    def visitReturnType(self, ctx):
+        if ctx.VOID_KW():
+            return TypeNode('void', pointer_depth=0, is_const=False)
+        return self.visit(ctx.type_())
+
+    # --------------------------------------------------------
+    # visitParamList (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: paramList : (param (COMMA param)*)?
+    #
+    # Geeft een lijst van ParamNode objecten terug.
+    # EDGE CASE: lege lijst → []
+    def visitParamList(self, ctx):
+        return [self.visit(p) for p in ctx.param()]
+
+    # --------------------------------------------------------
+    # visitParam (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: param : type ID
+    #
+    # Voorbeeld: int x  →  ParamNode(TypeNode('int'), 'x')
+    # Voorbeeld: const float* ptr → ParamNode(TypeNode('float',1,True), 'ptr')
+    def visitParam(self, ctx):
+        param_type = self.visit(ctx.type_())
+        name       = ctx.ID().getText()
+        return ParamNode(param_type, name)
+
+    # --------------------------------------------------------
+    # visitReturnStmt (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: returnStmt : RETURN_KW expression? SC
+    #
+    # EDGE CASE: return; (void) → ReturnNode(value=None)
+    # EDGE CASE: return 0; → ReturnNode(LiteralNode(0, 'int'))
+    def visitReturnStmt(self, ctx):
+        if ctx.expression():
+            value = self.visit(ctx.expression())
+        else:
+            value = None
+        return ReturnNode(value)
 
     # --------------------------------------------------------
     # visitBlock (ongewijzigd)
@@ -136,7 +251,7 @@ class CSTtoASTVisitor(ParseTreeVisitor):
         if ctx.comment():
             return self.visit(ctx.comment())
 
-        # NIEUW: control flow
+        # control flow
         if ctx.ifStmt():
             return self.visit(ctx.ifStmt())
         if ctx.whileStmt():
@@ -151,6 +266,10 @@ class CSTtoASTVisitor(ParseTreeVisitor):
             return self.visit(ctx.switchStmt())
         if ctx.scopeStmt():
             return self.visit(ctx.scopeStmt())
+
+        # NIEUW: return statement
+        if ctx.returnStmt():
+            return self.visit(ctx.returnStmt())
 
         # fallback: expression SC
         return self.visit(ctx.expression())

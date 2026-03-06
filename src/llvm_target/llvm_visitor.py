@@ -7,8 +7,10 @@ from ..parser.ast_nodes import (
     CommentNode, ArrayDeclNode, ArrayInitNode,
     ArrayAccessNode, StringLiteralNode,
     FunctionCallNode, IncludeNode,
-    # NIEUW — assignment 4:
-    EnumDefNode, IfNode, WhileNode, BreakNode, ContinueNode, ScopeNode
+    EnumDefNode, IfNode, WhileNode, BreakNode, ContinueNode, ScopeNode,
+    # Assignment 5 (nieuw):
+    ParamNode, FunctionDeclNode, FunctionDefNode,
+    ReturnNode, DefineNode, IncludeFileNode,
 )
 
 
@@ -33,17 +35,23 @@ class LLVMVisitor:
     def __init__(self):
         self.globals            = []        # globale string constanten
         self.func_decls         = set()     # printf / scanf declaraties nodig?
-        self.instructions       = []        # instructies in de main body
-        self.reg_counter        = 0         # teller voor %t0, %t1, ...
+        self.instructions       = []        # instructies in de HUIDIGE functie-body
+        self.reg_counter        = 0         # teller voor %t0, %t1, ... (globaal)
         self.str_counter        = 0         # teller voor @.str.0, @.str.1, ...
         self.string_cache       = {}        # raw_value → global_name (geen duplicaten)
         self.var_info           = {}        # naam → dict met type info
         self.stdio_included     = False
-        self.label_counter      = 0    # unieke teller voor if/while labels
-        self.loop_stack         = []   # stack van (break_label, continue_label)
-        self._block_terminated  = False  # True na br/ret → geen dubbele terminator
-        self.scope_stack        = [{}]   # stack van {original_name: llvm_name} per scope
-        self.name_counter       = {}     # original_name → aantal keer gedeclareerd (voor unieke namen)
+        self.label_counter      = 0         # unieke teller voor if/while labels
+        self.loop_stack         = []        # stack van (break_label, continue_label)
+        self._block_terminated  = False     # True na br/ret → geen dubbele terminator
+        self.scope_stack        = [{}]      # stack van {original_name: llvm_name} per scope
+        self.name_counter       = {}        # original_name → aantal keer gedeclareerd
+
+        # Assignment 5 nieuw:
+        self.functions          = []
+        self.func_return_types  = {}
+        self.current_func_name  = None
+        self.global_var_info    = {}        # naam → info dict voor GLOBALE variabelen (@ prefix)
 
     # ============================================================
     # HELPERS: registers, types, strings
@@ -178,7 +186,14 @@ class LLVMVisitor:
         return length
 
     def finalize(self) -> str:
-        """Assembleer de volledige LLVM IR output en geef als string terug."""
+        """
+        Assembleer de volledige LLVM IR output en geef als string terug.
+
+        Volgorde:
+          1. Globale string constanten
+          2. Externe declaraties (printf, scanf, user forward decls)
+          3. Alle functiedefinities in volgorde
+        """
         lines = []
 
         # globale string constanten
@@ -187,22 +202,24 @@ class LLVMVisitor:
         if self.globals:
             lines.append('')
 
-        # functie declaraties
+        # externe functie declaraties
         if 'printf' in self.func_decls:
             lines.append('declare i32 @printf(i8*, ...)')
         if 'scanf' in self.func_decls:
             lines.append('declare i32 @scanf(i8*, ...)')
+        # user forward declarations (functies zonder body)
+        for decl_line in self.func_decls:
+            if decl_line not in ('printf', 'scanf') and decl_line.startswith('declare '):
+                lines.append(decl_line)
         if self.func_decls:
             lines.append('')
 
-        # main functie
-        lines.append('define i32 @main() {')
-        lines.append('entry:')
-        lines.extend(self.instructions)
-        lines.append('  ret i32 0')
-        lines.append('}')
+        # alle functiedefinities
+        for func_lines in self.functions:
+            lines.extend(func_lines)
+            lines.append('')
 
-        return '\n'.join(lines)
+        return '\n'.join(lines).rstrip() + '\n'
 
     # ============================================================
     # TYPE COERCERING
@@ -308,12 +325,13 @@ class LLVMVisitor:
         if isinstance(node, VariableNode):
             llvm_name = self._lookup_llvm_name(node.name)
             info = self.var_info[llvm_name]
+            prefix = '@' if info.get('is_global') else '%'
             if info['is_array']:
                 array_t = self.llvm_array_type(info['base_type'], info['dimensions'])
-                return (f"%{llvm_name}", f"{array_t}*")
+                return (f"{prefix}{llvm_name}", f"{array_t}*")
             else:
                 llvm_t = self.llvm_type(info['base_type'], info['pointer_depth'])
-                return (f"%{llvm_name}", f"{llvm_t}*")
+                return (f"{prefix}{llvm_name}", f"{llvm_t}*")
 
         elif isinstance(node, ArrayAccessNode):
             return self._get_array_element_address(node)
@@ -370,16 +388,6 @@ class LLVMVisitor:
     # STRUCTUUR
     # ============================================================
 
-    def visitProgram(self, node) -> str:
-        # verwerk includes (zet stdio_included vlag)
-        for inc in node.includes:
-            inc.accept(self)
-
-        # genereer de body
-        node.body.accept(self)
-
-        return self.finalize()
-
     def visitInclude(self, node):
         if node.header == 'stdio.h':
             self.stdio_included = True
@@ -430,7 +438,13 @@ class LLVMVisitor:
         # store initialisatiewaarde als die er is
         if node.value is not None:
             val, val_type = node.value.accept(self)
-            val = self._coerce(val, val_type, llvm_t)
+            # EDGE CASE: int* ptr = 0  → 0 is een integer maar de variabele is een pointer.
+            # In LLVM is 'null' de correcte nul-pointer, niet de integer 0.
+            if depth > 0 and val == '0' and val_type in ('i32', 'i8'):
+                val = 'null'
+                val_type = llvm_t  # pointer type, geen coercering nodig
+            else:
+                val = self._coerce(val, val_type, llvm_t)
             self.emit(f"store {llvm_t} {val}, {llvm_t}* %{llvm_name}")
 
     def visitArrayDecl(self, node):
@@ -572,16 +586,16 @@ class LLVMVisitor:
         llvm_name = self._lookup_llvm_name(node.name)
         info = self.var_info.get(llvm_name)
         if info is None:
-            return ('0', 'i32')  # zou na semantic analysis niet mogen voorkomen
+            return ('0', 'i32')
 
         if info['is_array']:
-            # array als expressie → geef de pointer terug (bv. voor &arr)
             arr_t = self.llvm_array_type(info['base_type'], info['dimensions'])
             return (f"%{llvm_name}", f"{arr_t}*")
 
         llvm_t = self.llvm_type(info['base_type'], info['pointer_depth'])
         reg    = self.new_reg()
-        self.emit(f"{reg} = load {llvm_t}, {llvm_t}* %{llvm_name}")
+        prefix = '@' if info.get('is_global') else '%'
+        self.emit(f"{reg} = load {llvm_t}, {llvm_t}* {prefix}{llvm_name}")
         return (reg, llvm_t)
 
     def visitArrayAccess(self, node) -> tuple:
@@ -760,43 +774,57 @@ class LLVMVisitor:
 
     def visitFunctionCall(self, node) -> tuple:
         """
-        Emitteer een printf of scanf aanroep.
+        Emitteer een functie-aanroep.
 
-        printf/scanf gebruiken variadic argumenten in LLVM:
-          call i32 (i8*, ...) @printf(i8* %str, i32 %x, ...)
+        printf/scanf: variadic calling convention  → call i32 (i8*, ...) @naam(...)
+        user functies: vaste calling convention    → call <ret> @naam(...)
 
-        EDGE CASE: geen argumenten → lege argumentenlijst
-        EDGE CASE: char argument → sext naar i32 voor variadic calling convention
+        Assignment 5: gebruik func_return_types voor het juiste return type.
+        Argumenten worden gecoerceerd naar het verwachte parameter type.
+
+        EDGE CASE: void functie → de aanroep geeft geen waarde terug.
+          We geven ('0', 'i32') terug als fallback zodat de aanroep als
+          expressie-statement gebruikt kan worden.
+        EDGE CASE: char (i8) in variadic → sext naar i32 (C promotie-regels).
+        EDGE CASE: float in variadic → fpext naar double.
         """
-        if node.name in ('printf', 'scanf'):
+        is_variadic = node.name in ('printf', 'scanf')
+        if is_variadic:
             self.func_decls.add(node.name)
 
-        # evalueer alle argumenten
+        # evalueer argumenten
         arg_parts = []
         for arg in node.args:
             val, typ = arg.accept(self)
-            # variadic functies: char (i8) wordt gepromoveerd naar i32
-            if typ == 'i8':
-                promoted = self.new_reg()
-                self.emit(f"{promoted} = sext i8 {val} to i32")
-                val = promoted
-                typ = 'i32'
-            elif typ == 'float':
-                promoted = self.new_reg()
-                self.emit(f"{promoted} = fpext float {val} to double")
-                val = promoted
-                typ = 'double'
+            if is_variadic:
+                # variadic promotie
+                if typ == 'i8':
+                    promoted = self.new_reg()
+                    self.emit(f"{promoted} = sext i8 {val} to i32")
+                    val, typ = promoted, 'i32'
+                elif typ == 'float':
+                    promoted = self.new_reg()
+                    self.emit(f"{promoted} = fpext float {val} to double")
+                    val, typ = promoted, 'double'
             arg_parts.append(f"{typ} {val}")
 
         arg_str = ', '.join(arg_parts)
-        reg = self.new_reg()
+        llvm_ret = self.func_return_types.get(node.name, 'i32')
 
-        if node.name in ('printf', 'scanf'):
-            self.emit(f"{reg} = call i32 (i8*, ...) @{node.name}({arg_str})")
+        if llvm_ret == 'void':
+            # void functie → call zonder resultaatregister
+            if is_variadic:
+                self.emit(f"call void (i8*, ...) @{node.name}({arg_str})")
+            else:
+                self.emit(f"call void @{node.name}({arg_str})")
+            return ('0', 'i32')   # geen return waarde
         else:
-            self.emit(f"{reg} = call i32 @{node.name}({arg_str})")
-
-        return (reg, 'i32')
+            reg = self.new_reg()
+            if is_variadic:
+                self.emit(f"{reg} = call i32 (i8*, ...) @{node.name}({arg_str})")
+            else:
+                self.emit(f"{reg} = call {llvm_ret} @{node.name}({arg_str})")
+            return (reg, llvm_ret)
 
     def visitType(self, node):
         # TypeNode bevat geen code → niets te genereren
@@ -866,20 +894,211 @@ class LLVMVisitor:
 
     def visitProgram(self, node) -> str:
         """
-        UITGEBREID: verwerkt nu ook node.enums vóór de body.
+        Assignment 5: itereer over globals in volgorde.
 
-        Enums hoeven geen LLVM code te genereren — de constant folding
-        visitor heeft alle enum labels al omgezet naar LiteralNodes.
+        Pass 1: registreer return types van alle functies zodat
+                FunctionCall het juiste LLVM type kent.
+        Pass 2: genereer LLVM IR per global item.
         """
-        for inc in node.includes:
-            inc.accept(self)
+        # Pass 1: return types registreren (voor correcte call-instructies)
+        for item in node.globals:
+            if isinstance(item, (FunctionDefNode, FunctionDeclNode)):
+                ret_base  = item.return_type.base_type
+                ret_depth = item.return_type.pointer_depth
+                llvm_ret  = self.llvm_type(ret_base, ret_depth) if ret_base != 'void' else 'void'
+                self.func_return_types[item.name] = llvm_ret
 
-        for enum in node.enums:
-            enum.accept(self)
-
-        node.body.accept(self)
+        # Pass 2: code genereren
+        for item in node.globals:
+            if isinstance(item, IncludeNode):
+                item.accept(self)
+            elif isinstance(item, VarDeclNode):
+                base   = item.var_type.base_type
+                depth  = item.var_type.pointer_depth
+                llvm_t = self.llvm_type(base, depth)
+                if item.value is not None and hasattr(item.value, 'value'):
+                    init_val = item.value.value
+                    if base == 'float':
+                        import struct
+                        single = struct.unpack('>f', struct.pack('>f', float(init_val)))[0]
+                        packed = struct.pack('>d', single)
+                        hex_val = ''.join(f'{b:02X}' for b in packed)
+                        init_str = f"0x{hex_val}"
+                    elif base == 'char' and isinstance(init_val, str):
+                        init_str = str(ord(init_val))
+                    else:
+                        init_str = str(init_val)
+                else:
+                    init_str = '0' if base != 'float' else '0.0'
+                self.globals.append(f'@{item.name} = global {llvm_t} {init_str}')
+                self.global_var_info[item.name] = {
+                    'base_type': base, 'pointer_depth': depth,
+                    'is_array': False, 'dimensions': [],
+                    'llvm_type': llvm_t, 'is_global': True,
+                }
+            elif isinstance(item, FunctionDefNode):
+                item.accept(self)
+            elif isinstance(item, FunctionDeclNode):
+                item.accept(self)
 
         return self.finalize()
+
+    # ── Assignment 5: FUNCTIE DEFINITIE ───────────────────────────────────────
+
+    def visitFunctionDef(self, node: FunctionDefNode):
+        """
+        Genereer een volledige LLVM functiedefinitie.
+
+        STRATEGIE: we slaan de huidige per-functie-state op, resetten alles
+        voor de nieuwe functie, genereren de body, en bewaren het resultaat
+        in self.functions.
+
+        LLVM structuur:
+          define <ret> @naam(<params>) {
+          entry:
+            ; alloca + store voor elke parameter
+            ; body statements
+            ; impliciete ret als void en body geen ret heeft
+          }
+
+        PARAMETERS: elke parameter krijgt een alloca + store. Dit is de
+        standaard clang-aanpak: parameters zijn SSA waarden, maar we maken
+        een stack slot zodat we ze kunnen lezen via load (ongewijzigd patroon).
+
+        EDGE CASE: void functie zonder return → voeg 'ret void' toe.
+        EDGE CASE: main() → geef altijd 'ret i32 0' als fallback.
+        EDGE CASE: alle registers zijn globaal genummerd (reg_counter niet resetten)
+          zodat labels nooit botsen tussen functies.
+        """
+        # ── sla huidige state op ──────────────────────────────────────────────
+        saved_instructions      = self.instructions
+        saved_var_info          = self.var_info
+        saved_scope_stack       = self.scope_stack
+        saved_name_counter      = self.name_counter
+        saved_block_terminated  = self._block_terminated
+        saved_func_name         = self.current_func_name
+
+        # ── reset voor deze functie ───────────────────────────────────────────
+        self.instructions     = []
+        self.var_info         = {}
+        self.scope_stack      = [{}]
+        self.name_counter     = {}
+        self._block_terminated = False
+        self.current_func_name = node.name
+
+        # Globale variabelen beschikbaar maken binnen deze functie
+        for gname, ginfo in self.global_var_info.items():
+            self.var_info[gname] = ginfo
+
+        # ── LLVM parameter string opbouwen ────────────────────────────────────
+        llvm_ret = self.func_return_types.get(node.name, 'i32')
+        param_parts = []
+        for param in node.params:
+            p_llvm_t = self.llvm_type(param.param_type.base_type,
+                                       param.param_type.pointer_depth)
+            param_parts.append(f"{p_llvm_t} %{param.name}_arg")
+        params_str = ', '.join(param_parts)
+
+        # ── alloca + store voor elke parameter ────────────────────────────────
+        # Parameters komen binnen als SSA waarden (%naam_arg).
+        # We maken een stack slot (%naam) zodat de rest van de code
+        # gewoon load/store kan gebruiken, net als bij lokale variabelen.
+        for param in node.params:
+            p_base  = param.param_type.base_type
+            p_depth = param.param_type.pointer_depth
+            p_llvm_t = self.llvm_type(p_base, p_depth)
+
+            self.var_info[param.name] = {
+                'base_type':     p_base,
+                'pointer_depth': p_depth,
+                'is_array':      False,
+                'dimensions':    [],
+                'llvm_type':     p_llvm_t,
+            }
+            self.scope_stack[-1][param.name] = param.name
+            self.emit(f"%{param.name} = alloca {p_llvm_t}")
+            self.emit(f"store {p_llvm_t} %{param.name}_arg, {p_llvm_t}* %{param.name}")
+
+        # ── body ──────────────────────────────────────────────────────────────
+        node.body.accept(self)
+
+        # ── impliciete return als de body niet afsluit ────────────────────────
+        if not self._block_terminated:
+            if llvm_ret == 'void':
+                self.emit('ret void')
+            else:
+                # fallback — semantic analysis zou dit al als warning gemeld hebben
+                self.emit(f'ret {llvm_ret} 0')
+
+        # ── bewaar de functie ──────────────────────────────────────────────────
+        func_lines = [f'define {llvm_ret} @{node.name}({params_str}) {{',
+                      'entry:']
+        func_lines.extend(self.instructions)
+        func_lines.append('}')
+        self.functions.append(func_lines)
+
+        # ── herstel state ──────────────────────────────────────────────────────
+        self.instructions      = saved_instructions
+        self.var_info          = saved_var_info
+        self.scope_stack       = saved_scope_stack
+        self.name_counter      = saved_name_counter
+        self._block_terminated = saved_block_terminated
+        self.current_func_name = saved_func_name
+
+    def visitFunctionDecl(self, node: FunctionDeclNode):
+        """
+        Forward declarations genereren een LLVM 'declare' regel.
+        Alleen nodig als de definitie in een ander compilatie-eenheid zit
+        (bij ons: in een header). In ons geval hebben we de definitie altijd
+        in hetzelfde bestand, dus dit is mostly a no-op.
+
+        We sla de declaratie op als een speciale string in func_decls zodat
+        finalize() hem kan uitsturen als de definitie er niet bij is.
+        """
+        # Als er al een definitie is (geregistreerd via visitFunctionDef),
+        # dan hoeven we geen aparte declare te genereren.
+        # We doen niets — de definitie zelf is voldoende.
+        pass
+
+    def visitReturn(self, node: ReturnNode):
+        """
+        Genereer een LLVM 'ret' instructie.
+
+        LLVM vereist dat elke basic block eindigt met een terminator.
+        'ret' is een terminator → _block_terminated = True via emit_br wordt
+        hier handmatig gezet.
+
+        EDGE CASE: ret void → 'ret void'
+        EDGE CASE: ret met waarde → evalueer expressie, dan 'ret <type> <val>'
+        EDGE CASE: return na return (dead code) → _block_terminated blokkeert
+          dit al in visitBlock.
+        """
+        llvm_ret = self.func_return_types.get(self.current_func_name, 'i32')
+
+        if node.value is None or llvm_ret == 'void':
+            self.emit('ret void' if llvm_ret == 'void' else 'ret i32 0')
+        else:
+            val, val_type = node.value.accept(self)
+            # EDGE CASE: pointer teruggeven als int (bv. return &x in int functie)
+            # _coerce kent geen pointer→int conversie, dus we doen dat hier apart.
+            if val_type.endswith('*') and llvm_ret in ('i32', 'i8'):
+                reg = self.new_reg()
+                self.emit(f"{reg} = ptrtoint {val_type} {val} to {llvm_ret}")
+                val = reg
+            else:
+                val = self._coerce(val, val_type, llvm_ret)
+            self.emit(f'ret {llvm_ret} {val}')
+
+        self._block_terminated = True
+
+    def visitDefine(self, node):
+        pass  # preprocessor heeft al gedaan
+
+    def visitIncludeFile(self, node):
+        pass  # preprocessor heeft al gedaan
+
+    def visitParam(self, node):
+        pass  # parameters worden verwerkt in visitFunctionDef
 
     def visitBlock(self, node):
         """

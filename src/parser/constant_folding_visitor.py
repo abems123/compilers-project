@@ -8,9 +8,12 @@ from .ast_nodes import (
     CommentNode, ArrayDeclNode, ArrayInitNode,
     ArrayAccessNode, StringLiteralNode,
     FunctionCallNode, IncludeNode,
-    # Assignment 4 (nieuw):
+    # Assignment 4:
     EnumDefNode, IfNode, WhileNode,
-    BreakNode, ContinueNode, ScopeNode
+    BreakNode, ContinueNode, ScopeNode,
+    # Assignment 5 (nieuw):
+    ParamNode, FunctionDeclNode, FunctionDefNode,
+    ReturnNode, DefineNode, IncludeFileNode,
 )
 
 
@@ -141,16 +144,67 @@ class ConstantFoldingVisitor:
     # ============================================================
 
     def visitProgram(self, node):
-        # STAP 1: verwerk enum definities EERST zodat hun labels beschikbaar
-        # zijn als constante waarden tijdens het vouwen van de body.
-        new_enums = []
-        for enum_node in node.enums:
-            new_enums.append(enum_node.accept(self))
+        """
+        Assignment 5: itereer over globals in plaats van vaste body+enums structuur.
 
-        # STAP 2: verwerk de body
-        new_body = node.body.accept(self)
+        Enum definities worden EERST verwerkt zodat hun labels beschikbaar
+        zijn als constante waarden voor de rest.
+        """
+        # Pass 1: registreer enum labels als constanten
+        for item in node.globals:
+            if isinstance(item, EnumDefNode):
+                item.accept(self)
 
-        return ProgramNode(new_body, node.includes, new_enums)
+        # Pass 2: verwerk alle globals (functiedefinities, variabelen, etc.)
+        new_globals = []
+        for item in node.globals:
+            if isinstance(item, EnumDefNode):
+                new_globals.append(item)  # al verwerkt, ongewijzigd bewaren
+            else:
+                new_globals.append(item.accept(self))
+
+        return ProgramNode(new_globals)
+
+    # ── Assignment 5: nieuwe nodes ────────────────────────────────────────────
+
+    def visitFunctionDef(self, node):
+        """
+        Vouw de body van de functie. Parameters zijn niet constant,
+        dus we bewaren een schone known_values snapshot per functie.
+
+        EDGE CASE: known_values van globale consts/enums blijven geldig binnen
+        de functie — die zijn immutable. Lokale variabelen worden na de
+        functie weer geleegd (andere scope).
+        """
+        snapshot = self._snapshot()
+
+        new_params = node.params   # params veranderen niet bij folding
+        new_body   = node.body.accept(self)
+
+        # herstel known_values: lokale vars van de functie weggooien
+        self._invalidate_changed(snapshot)
+
+        return FunctionDefNode(node.return_type, node.name, new_params, new_body)
+
+    def visitFunctionDecl(self, node):
+        return node  # forward declarations veranderen niet
+
+    def visitReturn(self, node):
+        """Vouw de return-waarde als die een constante expressie is."""
+        if node.value is not None:
+            new_value = node.value.accept(self)
+        else:
+            new_value = None
+        return ReturnNode(new_value)
+
+    def visitDefine(self, node):
+        return node  # defines veranderen niet
+
+    def visitIncludeFile(self, node):
+        return node  # includes veranderen niet
+
+    def visitParam(self, node):
+        return node  # parameters veranderen niet
 
     def visitBlock(self, node):
         new_statements = []
@@ -383,6 +437,17 @@ class ConstantFoldingVisitor:
 
     def visitFunctionCall(self, node):
         new_args = [arg.accept(self) for arg in node.args]
+
+        # EDGE CASE: als een argument &x is (adres-van), dan geeft de aanroeper
+        # de pointer door aan de functie. De functie KAN x wijzigen via *ptr.
+        # We weten op compile-time niet of dat ook echt gebeurt, dus conservatief:
+        # verwijder x uit known_values zodat we x daarna niet meer fout propageren.
+        for arg in node.args:
+            if (isinstance(arg, UnaryOpNode)
+                    and arg.op == '&'
+                    and isinstance(arg.operand, VariableNode)):
+                self.known_values.pop(arg.operand.name, None)
+
         return FunctionCallNode(node.name, new_args)
 
     # ============================================================
