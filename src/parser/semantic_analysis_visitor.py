@@ -118,6 +118,10 @@ class SemanticAnalysisVisitor:
             entry = self.symbol_table.lookup(node.name)
             if entry is None:
                 return ('unknown', 0)
+            # Array-to-pointer decay: int arr[5] wordt behandeld als int*
+            # wanneer de array naam als waarde gebruikt wordt (bv. int* p = arr).
+            if entry.is_array:
+                return (entry.base_type, 1)
             # enum labels zijn opgeslagen als base_type='int'
             return (entry.base_type, entry.pointer_depth)
 
@@ -131,10 +135,22 @@ class SemanticAnalysisVisitor:
             return (entry.base_type, 0)
 
         elif isinstance(node, BinaryOpNode):
-            left_type,  _ = self.get_type(node.left)
-            right_type, _ = self.get_type(node.right)
+            left_type,  left_depth  = self.get_type(node.left)
+            right_type, right_depth = self.get_type(node.right)
             if node.op in ('==', '!=', '<', '>', '<=', '>=', '&&', '||'):
                 return ('int', 0)
+            # Pointer arithmetic: ptr + int of ptr - int geeft een pointer terug.
+            # ptr - ptr geeft een int terug (afstand in elementen).
+            if node.op == '+':
+                if left_depth > 0:
+                    return (left_type, left_depth)
+                if right_depth > 0:
+                    return (right_type, right_depth)
+            if node.op == '-':
+                if left_depth > 0 and right_depth == 0:
+                    return (left_type, left_depth)
+                if left_depth > 0 and right_depth > 0:
+                    return ('int', 0)  # ptr - ptr = int
             return (richer_type(left_type, right_type), 0)
 
         elif isinstance(node, UnaryOpNode):
@@ -153,6 +169,12 @@ class SemanticAnalysisVisitor:
             return (node.target_type.base_type, node.target_type.pointer_depth)
 
         elif isinstance(node, FunctionCallNode):
+            # malloc geeft een pointer terug (char* / void*)
+            if node.name == 'malloc':
+                return ('char', 1)
+            # free geeft void terug
+            if node.name == 'free':
+                return ('void', 0)
             # Assignment 5: zoek het echte return type op in de function_table
             func_entry = self.function_table.lookup(node.name)
             if func_entry is not None:
@@ -338,6 +360,45 @@ class SemanticAnalysisVisitor:
     # Assignment 5: FUNCTIE DEFINITIE
     # --------------------------------------------------------
 
+    def _all_paths_return(self, block) -> bool:
+        """
+        Controleert of elk uitvoeringspad in een blok eindigt met een return.
+
+        Regels:
+          - ReturnNode         → True (dit pad eindigt met een return)
+          - IfNode met else    → True alleen als ZOWEL then- als else-tak returnen
+          - IfNode zonder else → False (het if-blok kan worden overgeslagen)
+          - WhileNode          → False (de lus kan worden overgeslagen)
+          - Andere statements  → geen bijdrage, ga door
+
+        EDGE CASE: een return diep in een blok telt voor het hele blok
+          (we scannen van achter naar voor en stoppen bij de eerste return).
+        EDGE CASE: lege body → False (geen return).
+        EDGE CASE: void functies worden niet gecheckt (geen return nodig).
+        """
+        from .ast_nodes import ReturnNode, IfNode, WhileNode, BlockNode, ScopeNode
+
+        if block is None:
+            return False
+
+        statements = getattr(block, 'statements', [])
+
+        for stmt in reversed(statements):
+            if isinstance(stmt, ReturnNode):
+                return True
+            if isinstance(stmt, IfNode):
+                if stmt.else_block is None:
+                    return False  # geen else → pad zonder return bestaat
+                then_returns = self._all_paths_return(stmt.then_block)
+                else_returns = self._all_paths_return(stmt.else_block)
+                if then_returns and else_returns:
+                    return True
+                return False
+            if isinstance(stmt, ScopeNode):
+                if self._all_paths_return(stmt.body):
+                    return True
+        return False
+
     def visitFunctionDef(self, node: FunctionDefNode):
         """
         Bezoek de body van een functiedefinitie.
@@ -385,6 +446,15 @@ class SemanticAnalysisVisitor:
 
         # bezoek de body
         node.body.accept(self)
+
+        # Check: alle paden hebben een return?
+        # Alleen voor non-void functies. void functies mogen zonder return eindigen.
+        ret_base = entry.return_type[0]
+        if ret_base != 'void' and not self._all_paths_return(node.body):
+            self.warning(
+                f"Functie '{node.name}' heeft return type '{ret_base}' maar "
+                f"niet alle uitvoeringspaden eindigen met een return statement."
+            )
 
         self.symbol_table.pop_scope()
         self.current_function = prev_function
@@ -655,12 +725,20 @@ class SemanticAnalysisVisitor:
                 )
 
         # voeg toe aan symbol table
+        # is_const_ptr: pointer naar const data, bv. "const int* p"
+        # Dit is ANDERS dan "const int x" (de waarde zelf is const).
+        # const int*  → pointer_depth=1, is_const=False, is_const_ptr=True
+        # int* const  → pointer_depth=1, is_const=True,  is_const_ptr=False  (niet geïmplementeerd)
+        is_const_ptr = node.var_type.is_const and node.var_type.pointer_depth > 0
+        is_val_const = node.var_type.is_const and node.var_type.pointer_depth == 0
+
         entry = SymbolEntry(
             name          = node.name,
             base_type     = base if base in ('int', 'float', 'char') else 'int',
             pointer_depth = node.var_type.pointer_depth,
-            is_const      = node.var_type.is_const,
-            is_defined    = node.value is not None
+            is_const      = is_val_const,
+            is_defined    = node.value is not None,
+            is_const_ptr  = is_const_ptr,
         )
         self.symbol_table.declare(entry)
 
@@ -734,13 +812,28 @@ class SemanticAnalysisVisitor:
             )
             return
 
-        # check const assignment
+        # check const assignment op directe variabele: x = 5 waarbij x const is
         if isinstance(node.target, VariableNode):
             entry = self.symbol_table.lookup(node.target.name)
             if entry is not None and entry.is_const:
                 self.error(
                     f"Kan niet toewijzen aan const variabele '{node.target.name}'."
                 )
+
+        # check const pointer dereference: *p = 5 waarbij p een "const T*" is
+        # Dit is de kern van const casting: p zelf mag worden ge-reassigned,
+        # maar *p schrijven is verboden als p is_const_ptr heeft.
+        # UITZONDERING: als de pointer eerst non-const is gemaakt via const casting
+        # (float* q = const_ptr), dan is q.is_const_ptr=False → schrijven toegestaan.
+        if isinstance(node.target, UnaryOpNode) and node.target.op == '*':
+            inner = node.target.operand
+            if isinstance(inner, VariableNode):
+                ptr_entry = self.symbol_table.lookup(inner.name)
+                if ptr_entry is not None and ptr_entry.is_const_ptr:
+                    self.error(
+                        f"Kan niet schrijven via const pointer '*{inner.name}': "
+                        f"de pointer wijst naar const data."
+                    )
 
         node.target.accept(self)
 
@@ -753,7 +846,10 @@ class SemanticAnalysisVisitor:
         )
 
     def _check_implicit_conversion(self, target_type, target_depth, value_node, context):
-        """Ongewijzigd van assignment 3."""
+        """
+        Ongewijzigd van assignment 3, uitgebreid met const casting:
+        const T* → T* is toegestaan (const wegstrepen via pointer).
+        """
         value_type, value_depth = self.get_type(value_node)
 
         if value_type == 'unknown':
@@ -767,6 +863,14 @@ class SemanticAnalysisVisitor:
                     f"gevonden {'*' * value_depth}{value_type}."
                 )
             return
+
+        # Const casting: const T* toewijzen aan T* is expliciet toegestaan.
+        # We controleren of de RHS een const_ptr variabele is en de target niet.
+        # In dat geval: geen warning — dit is gewenst const-cast gedrag.
+        if target_depth > 0 and isinstance(value_node, VariableNode):
+            rhs_entry = self.symbol_table.lookup(value_node.name)
+            if rhs_entry is not None and rhs_entry.is_const_ptr:
+                return  # const casting → altijd toegestaan, geen warning
 
         if target_depth == 0 and value_depth == 0:
             if target_type in TYPE_RANK and value_type in TYPE_RANK:
@@ -820,10 +924,12 @@ class SemanticAnalysisVisitor:
             if entry is None:
                 self.error(f"Gebruik van niet-gedeclareerde array '{base_name}'.")
             elif not entry.is_array:
-                self.error(
-                    f"Variabele '{base_name}' is geen array "
-                    f"en kan niet geïndexeerd worden."
-                )
+                # Pointer indexering is ook geldig: int* p; p[i] is hetzelfde als *(p+i)
+                if entry.pointer_depth == 0:
+                    self.error(
+                        f"Variabele '{base_name}' is geen array en geen pointer "
+                        f"en kan niet geïndexeerd worden."
+                    )
 
         index_type, index_depth = self.get_type(node.index)
         if index_depth > 0:
@@ -883,6 +989,18 @@ class SemanticAnalysisVisitor:
                     f"Functie '{node.name}' gebruikt zonder #include <stdio.h>."
                 )
             return  # geen verdere checks voor variadische functies
+
+        # malloc / free: ingebouwde heap-functies, geen declaratie nodig.
+        # malloc(size) → void* (wij behandelen als i8* / char*)
+        # free(ptr)    → void
+        if node.name == 'malloc':
+            if len(node.args) != 1:
+                self.error("malloc verwacht precies 1 argument (grootte in bytes).")
+            return
+        if node.name == 'free':
+            if len(node.args) != 1:
+                self.error("free verwacht precies 1 argument (pointer).")
+            return
 
         # zoek de functie op in de function_table
         func_entry = self.function_table.lookup(node.name)

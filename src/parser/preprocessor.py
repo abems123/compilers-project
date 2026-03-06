@@ -47,6 +47,12 @@ class Preprocessor:
         # We slaan ze op in de volgorde waarin ze gevonden worden.
         self._defines: dict[str, str] = {}
 
+        # Stack voor conditionele compilatie (#ifndef/#ifdef/#else/#endif).
+        # Elk element is True (blok is actief) of False (blok wordt overgeslagen).
+        # Per bestand wordt deze stack gereset zodat geneste includes
+        # elkaars guards niet beïnvloeden.
+        self._cond_stack: list[bool] = []
+
     # ------------------------------------------------------------------
     # Publieke interface
     # ------------------------------------------------------------------
@@ -93,6 +99,11 @@ class Preprocessor:
         # Markeer dit bestand als 'in verwerking'
         self._included_files.add(filepath)
 
+        # Reset de conditie-stack voor dit bestand.
+        # Elke include guard (#ifndef GUARD / #endif) is bestandsspecifiek.
+        saved_stack = self._cond_stack
+        self._cond_stack = []
+
         source = filepath.read_text(encoding="utf-8")
         lines = source.splitlines(keepends=True)
 
@@ -115,6 +126,55 @@ class Preprocessor:
                 include_path = (filepath.parent / include_path_str).resolve()
                 included_text = self._process_file(include_path)
                 output_lines.append(included_text)
+                i += 1
+                continue
+
+            # ── #ifndef / #ifdef / #else / #endif ────────────────────────
+            # Include guard patroon:
+            #   #ifndef GUARD_H
+            #   #define GUARD_H
+            #   ...
+            #   #endif
+            #
+            # We houden een kleine stack bij van actieve condities.
+            # #ifndef NAAM → push True als NAAM nog niet gedefinieerd is
+            # #ifdef  NAAM → push True als NAAM wel gedefinieerd is
+            # #else        → flip de bovenste conditie
+            # #endif       → pop de stack
+            #
+            # Als de bovenste conditie False is, slaan we regels over.
+            # EDGE CASE: geneste #ifdef/#ifndef werken correct via de stack.
+            # EDGE CASE: #define binnen een False-blok wordt niet uitgevoerd.
+            if re.match(r'^\s*#\s*ifndef\s+(\w+)', stripped):
+                m = re.match(r'^\s*#\s*ifndef\s+(\w+)', stripped)
+                guard = m.group(1)
+                active = guard not in self._defines
+                self._cond_stack.append(active)
+                i += 1
+                continue
+
+            if re.match(r'^\s*#\s*ifdef\s+(\w+)', stripped):
+                m = re.match(r'^\s*#\s*ifdef\s+(\w+)', stripped)
+                guard = m.group(1)
+                active = guard in self._defines
+                self._cond_stack.append(active)
+                i += 1
+                continue
+
+            if re.match(r'^\s*#\s*else', stripped):
+                if self._cond_stack:
+                    self._cond_stack[-1] = not self._cond_stack[-1]
+                i += 1
+                continue
+
+            if re.match(r'^\s*#\s*endif', stripped):
+                if self._cond_stack:
+                    self._cond_stack.pop()
+                i += 1
+                continue
+
+            # Als we in een False-conditie zitten → hele lijn overslaan
+            if self._cond_stack and not self._cond_stack[-1]:
                 i += 1
                 continue
 
@@ -147,6 +207,9 @@ class Preprocessor:
                     line = re.sub(pattern, value, line)
             output_lines.append(line)
             i += 1
+
+        # Herstel de conditie-stack van het bovenliggende bestand
+        self._cond_stack = saved_stack
 
         return "".join(output_lines)
 

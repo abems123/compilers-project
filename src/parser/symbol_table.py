@@ -4,15 +4,20 @@
 class SymbolEntry:
     def __init__(self, name: str, base_type: str, pointer_depth: int,
                  is_const: bool, is_defined: bool, line: int = None,
-                 is_array: bool = False, dimensions: list = None):
+                 is_array: bool = False, dimensions: list = None,
+                 is_const_ptr: bool = False):
         self.name          = name
         self.base_type     = base_type
         self.pointer_depth = pointer_depth
-        self.is_const      = is_const
+        self.is_const      = is_const      # de variabele ZELF is const (const int x)
         self.is_defined    = is_defined
         self.line          = line
         self.is_array      = is_array
         self.dimensions    = dimensions if dimensions is not None else []
+        # is_const_ptr: de pointer wijst naar const data (const int* p)
+        # Dit laat const casting toe: float* p = const_float_ptr  ← OK
+        # maar *p = x via een const_ptr pointer ← Error
+        self.is_const_ptr  = is_const_ptr
 
     def type_str(self) -> str:
         const_str = "const " if self.is_const else ""

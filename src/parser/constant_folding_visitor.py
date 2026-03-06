@@ -387,6 +387,23 @@ class ConstantFoldingVisitor:
             self.known_values[node.name] = new_value
             self.is_const[node.name] = node.var_type.is_const
 
+        # Const casting: als het adres van een variabele (&x) wordt opgeslagen
+        # in een pointer (const of niet), kan die variabele later via const casting
+        # gewijzigd worden. Daarom: verwijder x uit known_values zodra &x
+        # in een pointer terecht komt — ook als het via een const pointer gaat.
+        #
+        # Voorbeeld: const int* cp = &x  →  x invalideren
+        #            int* p = &x         →  x invalideren
+        # Zo voorkomt we dat printf("%d", x) na *p=99 toch 5 afdrukt.
+        if (node.var_type.pointer_depth > 0
+                and isinstance(new_value, UnaryOpNode)
+                and new_value.op == '&'
+                and isinstance(new_value.operand, VariableNode)):
+            aliased = new_value.operand.name
+            # invalideer: via deze pointer (of een cast ervan) kan de waarde wijzigen
+            self.known_values.pop(aliased, None)
+            self.is_const[aliased] = False  # niet meer als const behandelen
+
         return VarDeclNode(node.var_type, node.name, new_value)
 
     def visitAssign(self, node):

@@ -53,6 +53,10 @@ class LLVMVisitor:
         self.current_func_name  = None
         self.global_var_info    = {}        # naam → info dict voor GLOBALE variabelen (@ prefix)
 
+        # Optimalisatie: set van variabelenamen die gelezen worden in de huidige functie.
+        # None = uitgeschakeld. Gezet door visitFunctionDef vóór body-generatie.
+        self._current_used_vars: set = None
+
     # ============================================================
     # HELPERS: registers, types, strings
     # ============================================================
@@ -82,6 +86,105 @@ class LLVMVisitor:
                 stripped = line.strip().lstrip('*').strip()
                 if stripped:
                     self.instructions.append(f"  ; {stripped}")
+
+    def _stmt_to_c(self, node) -> str:
+        """
+        Vertaalt een statement-AST-node terug naar een korte, leesbare C-string.
+        Wordt gebruikt als commentaar na de eerste LLVM-instructie van dat statement.
+
+        Geeft een lege string terug voor CommentNode (die heeft al zijn eigen comment).
+        Voor complexe nodes (if/while) houden we het bij de eerste regel, geen body.
+        """
+        from ..parser.ast_nodes import (
+            VarDeclNode, ArrayDeclNode, AssignNode, FunctionCallNode,
+            ReturnNode, BreakNode, ContinueNode, CommentNode,
+            IfNode, WhileNode, ScopeNode, EnumDefNode,
+            VariableNode, LiteralNode, BinaryOpNode, UnaryOpNode,
+            StringLiteralNode, ArrayAccessNode, CastNode,
+        )
+
+        def expr_to_c(e) -> str:
+            """Recursief een expressie omzetten naar C-string (beknopt)."""
+            if e is None:
+                return ''
+            if isinstance(e, LiteralNode):
+                if e.type_name == 'char':
+                    if isinstance(e.value, str):
+                        return f"'{e.value}'"
+                    return f"'\\x{e.value:02x}'"
+                return str(e.value)
+            if isinstance(e, StringLiteralNode):
+                return f'"{e.value[:20]}"'
+            if isinstance(e, VariableNode):
+                return e.name
+            if isinstance(e, BinaryOpNode):
+                return f'{expr_to_c(e.left)} {e.op} {expr_to_c(e.right)}'
+            if isinstance(e, UnaryOpNode):
+                if e.op in ('suffix++', 'suffix--'):
+                    return f'{expr_to_c(e.operand)}{e.op[6:]}'
+                if e.op in ('prefix++', 'prefix--'):
+                    return f'{e.op[6:]}{expr_to_c(e.operand)}'
+                return f'{e.op}{expr_to_c(e.operand)}'
+            if isinstance(e, ArrayAccessNode):
+                return f'{expr_to_c(e.array_expr)}[{expr_to_c(e.index)}]'
+            if isinstance(e, CastNode):
+                t = e.target_type
+                return f'({t.base_type}{"*"*t.pointer_depth}){expr_to_c(e.operand)}'
+            if isinstance(e, FunctionCallNode):
+                args = ', '.join(expr_to_c(a) for a in e.args[:3])
+                suffix = ', ...' if len(e.args) > 3 else ''
+                return f'{e.name}({args}{suffix})'
+            return '...'
+
+        def type_to_c(t) -> str:
+            const = 'const ' if t.is_const else ''
+            stars = '*' * t.pointer_depth
+            return f'{const}{t.base_type}{stars}'
+
+        if isinstance(node, CommentNode):
+            return ''  # al apart afgehandeld via visitComment
+
+        if isinstance(node, VarDeclNode):
+            t = type_to_c(node.var_type)
+            val = f' = {expr_to_c(node.value)}' if node.value else ''
+            return f'{t} {node.name}{val};'
+
+        if isinstance(node, ArrayDeclNode):
+            t = type_to_c(node.var_type)
+            dims = ''.join(f'[{d}]' for d in node.dimensions)
+            return f'{t} {node.name}{dims};'
+
+        if isinstance(node, AssignNode):
+            return f'{expr_to_c(node.target)} = {expr_to_c(node.value)};'
+
+        if isinstance(node, FunctionCallNode):
+            return f'{expr_to_c(node)};'
+
+        if isinstance(node, ReturnNode):
+            if node.value is None:
+                return 'return;'
+            return f'return {expr_to_c(node.value)};'
+
+        if isinstance(node, BreakNode):
+            return 'break;'
+
+        if isinstance(node, ContinueNode):
+            return 'continue;'
+
+        if isinstance(node, IfNode):
+            return f'if ({expr_to_c(node.condition)}) {{ ... }}'
+
+        if isinstance(node, WhileNode):
+            return f'while ({expr_to_c(node.condition)}) {{ ... }}'
+
+        if isinstance(node, ScopeNode):
+            return '{ ... }'
+
+        if isinstance(node, EnumDefNode):
+            return f'enum {node.name} {{ ... }};'
+
+        # expressie als statement (bv. i++ als losse regel)
+        return f'{expr_to_c(node)};'
 
     def llvm_base_type(self, base_type: str) -> str:
         """Zet een C basistype om naar een LLVM type string."""
@@ -207,6 +310,10 @@ class LLVMVisitor:
             lines.append('declare i32 @printf(i8*, ...)')
         if 'scanf' in self.func_decls:
             lines.append('declare i32 @scanf(i8*, ...)')
+        if 'malloc' in self.func_decls:
+            lines.append('declare i8* @malloc(i64)')
+        if 'free' in self.func_decls:
+            lines.append('declare void @free(i8*)')
         # user forward declarations (functies zonder body)
         for decl_line in self.func_decls:
             if decl_line not in ('printf', 'scanf') and decl_line.startswith('declare '):
@@ -262,6 +369,12 @@ class LLVMVisitor:
             tmp = self.new_reg()
             self.emit(f"{tmp} = fptosi float {value} to i32")
             self.emit(f"{reg} = trunc i32 {tmp} to i8")
+        elif from_type == 'i32' and to_type == 'i64':
+            self.emit(f"{reg} = sext i32 {value} to i64")
+        elif from_type == 'i8' and to_type == 'i64':
+            self.emit(f"{reg} = sext i8 {value} to i64")
+        elif from_type == 'i64' and to_type == 'i32':
+            self.emit(f"{reg} = trunc i64 {value} to i32")
         else:
             # geen bekende conversie → ongewijzigd teruggeven
             return value
@@ -372,8 +485,29 @@ class LLVMVisitor:
         if not isinstance(current, VariableNode):
             raise ValueError(f"Onverwachte base in array access: {current}")
 
-        name   = current.name
-        info   = self.var_info[name]
+        name = current.name
+        info = self.var_info[name]
+
+        # ── POINTER INDEXERING: int* p; p[i] = *(p + i) ────────────────────
+        # Een pointer (niet-array) variabele heeft is_array=False maar pointer_depth>0.
+        # p[i] is dan identiek aan getelementptr T, T* %p_val, i32 i
+        if not info['is_array'] and info['pointer_depth'] > 0:
+            elem_t  = self.llvm_type(info['base_type'], info['pointer_depth'] - 1)
+            ptr_t   = self.llvm_type(info['base_type'], info['pointer_depth'])
+            llvm_nm = self._lookup_llvm_name(name)
+            # load de pointer zelf
+            ptr_load = self.new_reg()
+            self.emit(f"{ptr_load} = load {ptr_t}, {ptr_t}* %{llvm_nm}")
+            # decay naar elem_t pointer als ptr_t is een array type — niet nodig hier
+            # voor elke dimensie in indices, stap op
+            result_ptr = ptr_load
+            for idx in indices:
+                gep_reg = self.new_reg()
+                self.emit(f"{gep_reg} = getelementptr {elem_t}, {ptr_t} {result_ptr}, i32 {idx}")
+                result_ptr = gep_reg
+            return (result_ptr, f"{elem_t}*")
+
+        # ── ARRAY INDEXERING: normale [N x T]* GEP ──────────────────────────
         arr_t  = self.llvm_array_type(info['base_type'], info['dimensions'])
         elem_t = self.llvm_base_type(info['base_type'])
 
@@ -407,6 +541,86 @@ class LLVMVisitor:
     # DECLARATIES
     # ============================================================
 
+    def _collect_used_vars(self, node, used: set, assign_target=False):
+        """
+        Loopt recursief door de AST en verzamelt de namen van alle variabelen
+        die GELEZEN worden (niet alleen als assignment-target voorkomen).
+
+        Parameters:
+          node          — het te doorzoeken AST-node
+          used          — de set waaraan gelezen namen worden toegevoegd
+          assign_target — True als dit node het directe doel van een assignment is
+                          (dan telt het NIET als "gelezen")
+
+        Logica:
+          - VariableNode in expressie-context → voeg naam toe aan used
+          - VariableNode als directe target van AssignNode → NIET toevoegen
+          - ArrayAccessNode als target → de array-naam NIET toevoegen,
+            maar de index-expressie WEL evalueren (die wordt gelezen)
+          - Alle andere nodes → recursief afdalen in kinderen
+
+        EDGE CASE: int x = foo(); waarbij x nooit gelezen wordt →
+          x is ongebruikt, maar foo() heeft side effects. visitVarDecl
+          evalueert de RHS nog steeds; alleen de alloca/store worden overgeslagen.
+        EDGE CASE: shadowing — we werken met namen, niet met LLVM-namen.
+          Twee variabelen met dezelfde naam in verschillende scopes tellen allebei.
+        """
+        from ..parser.ast_nodes import (
+            VariableNode, AssignNode, BinaryOpNode, UnaryOpNode,
+            ArrayAccessNode, FunctionCallNode, ReturnNode, VarDeclNode,
+            ArrayDeclNode, IfNode, WhileNode, BlockNode, ScopeNode,
+            CastNode, LiteralNode, StringLiteralNode, CommentNode,
+        )
+
+        if node is None:
+            return
+
+        if isinstance(node, VariableNode):
+            if not assign_target:
+                used.add(node.name)
+            return
+
+        if isinstance(node, AssignNode):
+            # target: alleen als array-access telt de array NIET mee,
+            # maar de index WEL. Bij directe variabele: niet mee.
+            if isinstance(node.target, ArrayAccessNode):
+                self._collect_used_vars(node.target.index, used)
+                # array-naam zelf is niet "gelezen" hier
+            # EDGE CASE: *ptr = x → de pointer ptr wordt WEL gelezen
+            # (we moeten hem laden om het adres te krijgen).
+            elif isinstance(node.target, UnaryOpNode) and node.target.op == '*':
+                self._collect_used_vars(node.target.operand, used)
+            # in alle andere gevallen: target niet als gelezen markeren
+            self._collect_used_vars(node.value, used)
+            return
+
+        if isinstance(node, VarDeclNode):
+            # de naam die gedeclareerd wordt telt niet als lees
+            if node.value is not None:
+                self._collect_used_vars(node.value, used)
+            return
+
+        if isinstance(node, ArrayAccessNode):
+            # array-naam: als we hier komen is het een lees-context
+            if not assign_target:
+                used.add(node.array_expr.name if isinstance(node.array_expr, VariableNode) else '')
+            self._collect_used_vars(node.index, used)
+            return
+
+        # voor alle andere nodes: afdalen in alle kinderen
+        for attr in ('left', 'right', 'operand', 'value', 'condition',
+                     'then_block', 'else_block', 'body', 'update'):
+            child = getattr(node, attr, None)
+            if child is not None:
+                self._collect_used_vars(child, used)
+
+        # collecties (lijsten van nodes)
+        for attr in ('statements', 'args', 'params', 'elements'):
+            children = getattr(node, attr, None)
+            if children:
+                for child in children:
+                    self._collect_used_vars(child, used)
+
     def visitVarDecl(self, node):
         """
         Genereer alloca + optioneel store voor een variabele declaratie.
@@ -431,6 +645,22 @@ class LLVMVisitor:
             'dimensions':    [],
             'llvm_type':     llvm_t
         }
+
+        # ── Ongebruikte variabelen optimalisatie ────────────────────────────
+        # Als de variabele nooit gelezen wordt, sla de alloca + store over.
+        # De RHS-expressie wordt nog WEL geëvalueerd (side effects, bv. foo()).
+        # UITZONDERING: globale variabelen altijd genereren (andere functies
+        # kunnen ze lezen). Parameters worden niet via visitVarDecl aangemaakt.
+        is_unused = (
+            self._current_used_vars is not None
+            and name not in self._current_used_vars
+        )
+
+        if is_unused:
+            # Evalueer de RHS nog wel (side effects), maar gooi het resultaat weg
+            if node.value is not None:
+                node.value.accept(self)
+            return
 
         # alloca met unieke naam
         self.emit(f"%{llvm_name} = alloca {llvm_t}")
@@ -608,22 +838,178 @@ class LLVMVisitor:
         self.emit(f"{reg} = load {elem_type}, {elem_type}* {addr}")
         return (reg, elem_type)
 
+    def _ptr_elem_type(self, ptr_type: str) -> str:
+        """Geeft het element-type terug van een pointer type: 'i32*' → 'i32'."""
+        return ptr_type[:-1]
+
+    def _ptr_elem_size(self, ptr_type: str) -> int:
+        """
+        Geeft de grootte in bytes van het element type van een pointer.
+        Nodig voor ptr - ptr: het verschil in adressen delen door de elementgrootte.
+          i8*    → 1
+          i32*   → 4
+          float* → 4
+          i64*   → 8
+        """
+        sizes = {'i8': 1, 'i16': 2, 'i32': 4, 'i64': 8, 'float': 4, 'double': 8}
+        return sizes.get(self._ptr_elem_type(ptr_type), 4)
+
+    def _decay_array_ptr(self, val: str, val_type: str) -> tuple:
+        """
+        Array-to-pointer decay: zet een array pointer [N x T]* om naar T*.
+
+        In C wordt een array naam automatisch omgezet naar een pointer naar
+        het eerste element: int arr[5] → int* (punt naar arr[0]).
+
+        Voorbeeld:
+          val_type = '[5 x i32]*'
+          → emit: %reg = getelementptr [5 x i32], [5 x i32]* %arr, i32 0, i32 0
+          → return (%reg, 'i32*')
+
+        Als val_type al een gewone pointer is (i32*, float*, ...) → ongewijzigd.
+        EDGE CASE: [2 x [3 x i32]]* → decay naar [3 x i32]* (één laag afpellen).
+        """
+        import re
+        m = re.match(r'^\[(\d+) x (.+)\]\*$', val_type)
+        if m:
+            n         = m.group(1)
+            elem_type = m.group(2)
+            arr_type  = f"[{n} x {elem_type}]"
+            reg = self.new_reg()
+            self.emit(f"{reg} = getelementptr {arr_type}, {arr_type}* {val}, i32 0, i32 0")
+            return (reg, f"{elem_type}*")
+        return (val, val_type)
+
+    def _emit_pointer_op(self, op: str,
+                         left_val: str,  left_type: str,
+                         right_val: str, right_type: str) -> tuple:
+        """
+        Genereert LLVM IR voor pointer arithmetic en pointer vergelijkingen.
+
+        Gevallen:
+          ptr + int  →  getelementptr <elem>, <ptr_type> <ptr>, i32 <idx>
+          int + ptr  →  zelfde (optelling is commutatief)
+          ptr - int  →  getelementptr met -idx  (sub i32 0, idx)
+          ptr - ptr  →  ptrtoint beide naar i64, sub, sdiv door elementgrootte, trunc naar i32
+          ptr CMP x  →  ptrtoint ptr naar i64, x naar i64, icmp (unsigned voor ordening)
+
+        EDGE CASE: ptr - int waarbij int een literal '5' is → we negeren het eerst via
+          sub i32 0, 5 en geven dat als GEP-index mee.
+        EDGE CASE: ptr == 0 of ptr != 0 (null-check) → 0 wordt omgezet naar i64 0 via sext.
+        EDGE CASE: het element type van een pointer ptr_type = 'i32*' is 'i32'.
+          Voor ptr - ptr: de afstand in bytes / 4 = afstand in elementen.
+        """
+        # ── Array-to-pointer decay ──────────────────────────────────────────
+        # int arr[5] → [5 x i32]* in LLVM. Maar pointer arithmetic verwacht i32*.
+        # Decay beide kanten vóór we verder gaan.
+        left_val,  left_type  = self._decay_array_ptr(left_val,  left_type)
+        right_val, right_type = self._decay_array_ptr(right_val, right_type)
+
+        left_is_ptr  = left_type.endswith('*')
+        right_is_ptr = right_type.endswith('*')
+
+        # ── ptr + int  of  int + ptr ─────────────────────────────────────────
+        if op == '+' and (left_is_ptr != right_is_ptr):
+            if left_is_ptr:
+                ptr_val, ptr_type = left_val, left_type
+                idx_val, idx_type = right_val, right_type
+            else:
+                ptr_val, ptr_type = right_val, right_type
+                idx_val, idx_type = left_val, left_type
+
+            elem_type = self._ptr_elem_type(ptr_type)
+            idx_val   = self._coerce(idx_val, idx_type, 'i32')
+            reg = self.new_reg()
+            self.emit(f"{reg} = getelementptr {elem_type}, {ptr_type} {ptr_val}, i32 {idx_val}")
+            return (reg, ptr_type)
+
+        # ── ptr - int ────────────────────────────────────────────────────────
+        if op == '-' and left_is_ptr and not right_is_ptr:
+            elem_type = self._ptr_elem_type(left_type)
+            idx_val   = self._coerce(right_val, right_type, 'i32')
+            neg_reg   = self.new_reg()
+            self.emit(f"{neg_reg} = sub i32 0, {idx_val}")
+            reg = self.new_reg()
+            self.emit(f"{reg} = getelementptr {elem_type}, {left_type} {left_val}, i32 {neg_reg}")
+            return (reg, left_type)
+
+        # ── ptr - ptr ────────────────────────────────────────────────────────
+        if op == '-' and left_is_ptr and right_is_ptr:
+            size  = self._ptr_elem_size(left_type)
+            l_int = self.new_reg()
+            r_int = self.new_reg()
+            diff  = self.new_reg()
+            quot  = self.new_reg()
+            result = self.new_reg()
+            self.emit(f"{l_int} = ptrtoint {left_type} {left_val} to i64")
+            self.emit(f"{r_int} = ptrtoint {right_type} {right_val} to i64")
+            self.emit(f"{diff} = sub i64 {l_int}, {r_int}")
+            self.emit(f"{quot} = sdiv i64 {diff}, {size}")
+            self.emit(f"{result} = trunc i64 {quot} to i32")
+            return (result, 'i32')
+
+        # ── vergelijkingen met pointers ──────────────────────────────────────
+        if op in ('==', '!=', '<', '>', '<=', '>='):
+            if left_is_ptr:
+                l64 = self.new_reg()
+                self.emit(f"{l64} = ptrtoint {left_type} {left_val} to i64")
+                cmp_left, cmp_left_t = l64, 'i64'
+            else:
+                cmp_left  = self._coerce(left_val, left_type, 'i64')
+                cmp_left_t = 'i64'
+
+            if right_is_ptr:
+                r64 = self.new_reg()
+                self.emit(f"{r64} = ptrtoint {right_type} {right_val} to i64")
+                cmp_right, cmp_right_t = r64, 'i64'
+            else:
+                cmp_right  = self._coerce(right_val, right_type, 'i64')
+                cmp_right_t = 'i64'
+
+            # unsigned vergelijking voor pointer ordening (ult/ugt/ule/uge)
+            # equality/inequality is signed-agnostic (eq/ne)
+            cmp_map = {
+                '==': 'eq',  '!=': 'ne',
+                '<':  'ult', '>':  'ugt',
+                '<=': 'ule', '>=': 'uge'
+            }
+            cmp_reg = self.new_reg()
+            self.emit(f"{cmp_reg} = icmp {cmp_map[op]} i64 {cmp_left}, {cmp_right}")
+            result = self.new_reg()
+            self.emit(f"{result} = zext i1 {cmp_reg} to i32")
+            return (result, 'i32')
+
+        # fallback (bv. ptr * int heeft geen betekenis)
+        return ('0', 'i32')
+
     def visitBinaryOp(self, node) -> tuple:
         """
         Emitteer een binaire operatie.
 
         Stap 1: evalueer beide operanden
-        Stap 2: coerceer naar gemeenschappelijk type
-        Stap 3: emitteer de juiste LLVM instructie
+        Stap 2: check op pointer arithmetic → delegeer naar _emit_pointer_op
+        Stap 3: coerceer naar gemeenschappelijk type
+        Stap 4: emitteer de juiste LLVM instructie
 
         LLVM instructies:
           int:   add, sub, mul, sdiv, srem, and, or, xor, shl, ashr
           float: fadd, fsub, fmul, fdiv
           cmp:   icmp (int), fcmp (float) → i1 → zext naar i32
           &&/||: icmp ne 0 op beide, dan and/or i1, zext
+          ptr:   getelementptr, ptrtoint+sub+sdiv (zie _emit_pointer_op)
         """
         left_val,  left_type  = node.left.accept(self)
         right_val, right_type = node.right.accept(self)
+
+        # ── POINTER ARITHMETIC — intercepteer vóór _common_type ─────────────
+        # _common_type begrijpt geen pointer types → dit MOET eerst!
+        left_is_ptr  = left_type.endswith('*')
+        right_is_ptr = right_type.endswith('*')
+
+        if left_is_ptr or right_is_ptr:
+            return self._emit_pointer_op(
+                node.op, left_val, left_type, right_val, right_type
+            )
 
         result_type = self._common_type(left_type, right_type)
         left_val    = self._coerce(left_val,  left_type,  result_type)
@@ -724,8 +1110,15 @@ class LLVMVisitor:
 
             self.emit(f"{old_val} = load {elem_type}, {addr_ptr_type} {addr}")
 
-            llvm_op = 'add' if '++' in node.op else 'sub'
-            self.emit(f"{new_val} = {llvm_op} {elem_type} {old_val}, 1")
+            if elem_type.endswith('*'):
+                # p++ of p-- op een pointer: GEP in plaats van add/sub
+                inner_elem = self._ptr_elem_type(elem_type)
+                delta      = '1' if '++' in node.op else '-1'
+                self.emit(f"{new_val} = getelementptr {inner_elem}, {elem_type} {old_val}, i32 {delta}")
+            else:
+                llvm_op = 'add' if '++' in node.op else 'sub'
+                self.emit(f"{new_val} = {llvm_op} {elem_type} {old_val}, 1")
+
             self.emit(f"store {elem_type} {new_val}, {addr_ptr_type} {addr}")
 
             # prefix geeft nieuwe waarde terug, suffix geeft oude waarde terug
@@ -788,6 +1181,39 @@ class LLVMVisitor:
         EDGE CASE: char (i8) in variadic → sext naar i32 (C promotie-regels).
         EDGE CASE: float in variadic → fpext naar double.
         """
+        # ── malloc: call i8* @malloc(i64 size) ────────────────────────────
+        # malloc(n) geeft een i8* pointer naar heap-geheugen van n bytes.
+        # De grootte wordt uitgebreid naar i64 (LLVM vereist dit).
+        # De i8* wordt daarna gecast naar het gewenste pointer type door de
+        # omringende CastNode of VarDeclNode.
+        if node.name == 'malloc':
+            self.func_decls.add('malloc')
+            if node.args:
+                size_val, size_type = node.args[0].accept(self)
+                size_val = self._coerce(size_val, size_type, 'i64')
+            else:
+                size_val = '0'
+            reg = self.new_reg()
+            self.emit(f"{reg} = call i8* @malloc(i64 {size_val})")
+            return (reg, 'i8*')
+
+        # ── free: call void @free(i8* ptr) ─────────────────────────────────
+        # free(ptr) geeft heap-geheugen terug.
+        # De pointer wordt eerst gecast naar i8* (malloc geeft i8* terug).
+        if node.name == 'free':
+            self.func_decls.add('free')
+            if node.args:
+                ptr_val, ptr_type = node.args[0].accept(self)
+                # cast naar i8* als het nog niet i8* is
+                if ptr_type != 'i8*':
+                    cast_reg = self.new_reg()
+                    self.emit(f"{cast_reg} = bitcast {ptr_type} {ptr_val} to i8*")
+                    ptr_val = cast_reg
+            else:
+                ptr_val = 'null'
+            self.emit(f"call void @free(i8* {ptr_val})")
+            return ('0', 'i32')
+
         is_variadic = node.name in ('printf', 'scanf')
         if is_variadic:
             self.func_decls.add(node.name)
@@ -977,6 +1403,7 @@ class LLVMVisitor:
         saved_name_counter      = self.name_counter
         saved_block_terminated  = self._block_terminated
         saved_func_name         = self.current_func_name
+        saved_used_vars         = self._current_used_vars
 
         # ── reset voor deze functie ───────────────────────────────────────────
         self.instructions     = []
@@ -985,6 +1412,11 @@ class LLVMVisitor:
         self.name_counter     = {}
         self._block_terminated = False
         self.current_func_name = node.name
+
+        # Bereken welke variabelen gelezen worden in deze functie.
+        used = set()
+        self._collect_used_vars(node.body, used)
+        self._current_used_vars = used
 
         # Globale variabelen beschikbaar maken binnen deze functie
         for gname, ginfo in self.global_var_info.items():
@@ -1042,8 +1474,9 @@ class LLVMVisitor:
         self.var_info          = saved_var_info
         self.scope_stack       = saved_scope_stack
         self.name_counter      = saved_name_counter
-        self._block_terminated = saved_block_terminated
-        self.current_func_name = saved_func_name
+        self._block_terminated  = saved_block_terminated
+        self.current_func_name  = saved_func_name
+        self._current_used_vars = saved_used_vars
 
     def visitFunctionDecl(self, node: FunctionDeclNode):
         """
@@ -1103,14 +1536,45 @@ class LLVMVisitor:
     def visitBlock(self, node):
         """
         UITGEBREID: stopt zodra het blok afgesloten is (dead code na break/continue).
+        Voegt na de EERSTE LLVM-instructie van elk statement een comment toe
+        met de originele C-code, conform de assignment 3 eis.
 
-        EDGE CASE: break of continue midden in een blok zet _block_terminated=True.
-        De rest van het blok is dan dead code en wordt overgeslagen.
+        EDGE CASE: CommentNode genereert zelf al een comment via visitComment —
+          die krijgt dus geen extra comment.
+        EDGE CASE: als een statement nul instructies genereert (bv. EnumDefNode),
+          wordt er geen comment toegevoegd.
+        EDGE CASE: als de eerste nieuwe instructie al een label-definitie is
+          (bv. 'if.then.0:'), plakken we het comment op de instructie DAARNA,
+          want label-regels mogen geen inline comment hebben in LLVM IR.
         """
+        from ..parser.ast_nodes import CommentNode
+
         for stmt in node.statements:
             if self._block_terminated:
                 break
+
+            # Houd bij hoeveel instructies er al zijn vóór dit statement
+            idx_before = len(self.instructions)
+
             stmt.accept(self)
+
+            # Geen comment voor CommentNode (heeft al een eigen LLVM comment)
+            if isinstance(stmt, CommentNode):
+                continue
+
+            # Zoek de eerste nieuwe instructie die geen label is
+            c_code = self._stmt_to_c(stmt)
+            if not c_code:
+                continue
+
+            for i in range(idx_before, len(self.instructions)):
+                instr = self.instructions[i].rstrip()
+                # Label-regels eindigen op ':' zonder leading whitespace
+                if instr.endswith(':') and not instr.startswith('  '):
+                    continue  # label overslaan, zoek volgende instructie
+                # Voeg comment toe aan het einde van deze instructie
+                self.instructions[i] = f'{instr}  ; {c_code}'
+                break  # alleen de EERSTE instructie krijgt het comment
 
     def visitEnumDef(self, node):
         """
