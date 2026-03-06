@@ -4,10 +4,13 @@ from .ast_nodes import (
     LiteralNode, BinaryOpNode, UnaryOpNode,
     VariableNode, VarDeclNode, AssignNode,
     CastNode, TypeNode, BlockNode, ProgramNode,
-    # Nieuw in assignment 3:
+    # Assignment 3:
     CommentNode, ArrayDeclNode, ArrayInitNode,
     ArrayAccessNode, StringLiteralNode,
-    FunctionCallNode, IncludeNode
+    FunctionCallNode, IncludeNode,
+    # Assignment 4 (nieuw):
+    EnumDefNode, IfNode, WhileNode,
+    BreakNode, ContinueNode, ScopeNode
 )
 
 
@@ -21,14 +24,29 @@ class ConstantFoldingVisitor:
     2. Constant Propagation: vervangt variabelen met bekende waarden door hun literal.
        Voorbeeld: const int x = 5; int y = x + 3;  →  int y = 8;
 
-    Assignment 3 uitbreiding:
-      De nieuwe node types (Comment, ArrayDecl, ArrayInit, ArrayAccess,
-      StringLiteral, FunctionCall, Include) worden grotendeels ongewijzigd
-      doorgegeven — we vouwen geen arrays of functie-aanroepen.
+    Assignment 4 uitbreiding:
+      - Enum labels worden als constante int waarden geregistreerd (0, 1, 2, ...)
+        en kunnen dus gevouwen worden in expressies: OFFLINE + 1 → 3
+      - If/while/for/scope: known_values worden per scope bijgehouden.
+        Een variabele die ALLEEN in een if-tak verandert, is na het if-statement
+        niet meer betrouwbaar bekend → we verwijderen hem uit known_values.
+      - BreakNode, ContinueNode: worden ongewijzigd doorgegeven.
+      - ScopeNode: behandeld als een blok met eigen scope voor known_values.
 
-      Uitzondering: de expressies BINNEN array initialisatoren en functie-
-      argumenten worden WEL gevouwen als ze constant zijn.
-      Voorbeeld: int arr[3] = {1+2, 4, 5*1};  →  {3, 4, 5}
+    SCOPE-STRATEGIE voor known_values:
+      Bij elk blok met een eigen scope (if-tak, while-body, scope-node)
+      slaan we een SNAPSHOT op van known_values vóór het blok.
+      Na het blok vergelijken we: waarden die veranderd zijn worden
+      VERWIJDERD uit known_values (conservatief correcte aanpak).
+
+      Waarom conservatief?
+        int x = 5;
+        if (cond) { x = 10; }
+        // hier weten we NIET of x 5 of 10 is (hangt af van cond op runtime)
+        // dus x verwijderen we uit known_values
+
+      Enum labels en globale consts worden NOOIT verwijderd uit known_values
+      (ze zijn immutable per definitie).
     """
 
     def __init__(self):
@@ -39,13 +57,100 @@ class ConstantFoldingVisitor:
         self.is_const = {}
 
     # ============================================================
-    # STRUCTUUR: program, block, statements
+    # HULPMETHODE: snapshot voor scope-correcte propagation
+    # ============================================================
+
+    def _snapshot(self) -> dict:
+        """Geeft een kopie van known_values terug (voor scope-herstel)."""
+        return dict(self.known_values)
+
+    def _invalidate_changed(self, snapshot: dict):
+        """
+        Verwijdert uit known_values alle namen die veranderd zijn t.o.v. snapshot.
+        Zo weet de code na een if/while dat die variabelen niet meer betrouwbaar zijn.
+
+        EDGE CASE: variabelen die IN het blok NIEUW gedeclareerd zijn en
+        dus NIET in de snapshot staan, worden ook verwijderd — ze zijn
+        buiten het blok niet zichtbaar (out-of-scope).
+
+        EDGE CASE: const variabelen en enum labels (is_const=True) worden
+        NOOIT verwijderd — ze kunnen toch niet veranderd zijn.
+        """
+        keys_to_remove = []
+        for name in list(self.known_values.keys()):
+            if self.is_const.get(name, False):
+                continue  # consts en enum labels blijven altijd geldig
+            if name not in snapshot:
+                keys_to_remove.append(name)  # nieuw in dit blok → niet zichtbaar buiten
+            elif self.known_values[name] != snapshot[name]:
+                keys_to_remove.append(name)  # veranderd in dit blok → niet betrouwbaar
+        for name in keys_to_remove:
+            del self.known_values[name]
+
+    def _collect_assigned_vars(self, node) -> set:
+        """
+        Verzamelt alle variabelenamen die ergens in een AST-deelboom
+        worden geassigned (via AssignNode of VarDeclNode).
+
+        Wordt gebruikt door visitWhile om vóór het vouwen van de conditie
+        al te weten welke vars onbetrouwbaar zijn — zodat x < 10 NIET
+        gevouwen wordt naar 1 alleen omdat x toevallig vóór de lus
+        een bekende waarde had.
+
+        EDGE CASE: geneste if/while/scope worden ook doorzocht.
+        EDGE CASE: prefix++/suffix++ zijn ook assignments.
+        EDGE CASE: array assignments (arr[i] = x) worden genegeerd
+                   (array elementen zitten toch niet in known_values).
+        """
+        assigned = set()
+
+        if isinstance(node, AssignNode):
+            if isinstance(node.target, VariableNode):
+                assigned.add(node.target.name)
+            assigned |= self._collect_assigned_vars(node.value)
+
+        elif isinstance(node, VarDeclNode):
+            assigned.add(node.name)
+            if node.value is not None:
+                assigned |= self._collect_assigned_vars(node.value)
+
+        elif isinstance(node, BlockNode):
+            for stmt in node.statements:
+                assigned |= self._collect_assigned_vars(stmt)
+
+        elif isinstance(node, IfNode):
+            assigned |= self._collect_assigned_vars(node.then_block)
+            if node.else_block is not None:
+                assigned |= self._collect_assigned_vars(node.else_block)
+
+        elif isinstance(node, WhileNode):
+            assigned |= self._collect_assigned_vars(node.body)
+
+        elif isinstance(node, ScopeNode):
+            assigned |= self._collect_assigned_vars(node.body)
+
+        elif isinstance(node, UnaryOpNode):
+            if node.op in ('prefix++', 'prefix--', 'suffix++', 'suffix--'):
+                if isinstance(node.operand, VariableNode):
+                    assigned.add(node.operand.name)
+
+        return assigned
+
+    # ============================================================
+    # STRUCTUUR: program, block
     # ============================================================
 
     def visitProgram(self, node):
-        # NIEUW: geef includes door aan de nieuwe ProgramNode
+        # STAP 1: verwerk enum definities EERST zodat hun labels beschikbaar
+        # zijn als constante waarden tijdens het vouwen van de body.
+        new_enums = []
+        for enum_node in node.enums:
+            new_enums.append(enum_node.accept(self))
+
+        # STAP 2: verwerk de body
         new_body = node.body.accept(self)
-        return ProgramNode(new_body, node.includes)
+
+        return ProgramNode(new_body, node.includes, new_enums)
 
     def visitBlock(self, node):
         new_statements = []
@@ -54,12 +159,171 @@ class ConstantFoldingVisitor:
             new_statements.append(new_stmt)
         return BlockNode(new_statements)
 
+    # ============================================================
+    # NIEUW: ENUM DEFINITIE
+    # ============================================================
+
+    def visitEnumDef(self, node):
+        """
+        Registreer alle enum labels als constante int waarden.
+
+        Voorbeeld:
+          enum Status { READY, BUSY, OFFLINE }
+          → known_values['READY']   = LiteralNode(0, 'int')
+          → known_values['BUSY']    = LiteralNode(1, 'int')
+          → known_values['OFFLINE'] = LiteralNode(2, 'int')
+
+        Ze worden ook als 'const' gemarkeerd zodat _invalidate_changed()
+        ze nooit verwijdert.
+
+        EDGE CASE: als twee enums dezelfde labelnaam hebben, overschrijft
+        de laatste. De semantic analysis zal dit al als error melden,
+        dus hier hoeven we het niet te checken.
+        """
+        for i, label in enumerate(node.labels):
+            literal = LiteralNode(i, 'int')
+            self.known_values[label] = literal
+            self.is_const[label]     = True   # nooit invalideren
+
+        return node  # EnumDefNode zelf verandert niet
+
+    # ============================================================
+    # NIEUW: CONTROL FLOW NODES
+    # ============================================================
+
+    def visitIf(self, node):
+        """
+        Vouw de conditie. Bezoek beide takken conservatief:
+        na het if-statement invalideren we waarden die in een tak
+        veranderd kunnen zijn.
+
+        EDGE CASE: als de conditie een constante is (bv. if (1) { ... }),
+        kunnen we in principe de dode tak weggooien. We doen dit NIET —
+        dat is dead code elimination, een aparte optimalisatie. We vouwen
+        alleen de conditie-expressie zelf.
+
+        SCOPE: snapshot vóór then-tak, snapshot vóór else-tak, daarna
+        invalideer wat in BEIDE takken mogelijk veranderd is.
+        """
+        new_condition = node.condition.accept(self)
+
+        # then-tak: snapshot → bezoek → vergelijk
+        snap_before_then = self._snapshot()
+        new_then = node.then_block.accept(self)
+        snap_after_then = self._snapshot()
+
+        # herstel naar voor-then snapshot voor de else-tak
+        self.known_values = dict(snap_before_then)
+
+        # else-tak (optioneel)
+        new_else = None
+        if node.else_block is not None:
+            snap_before_else = self._snapshot()
+            new_else = node.else_block.accept(self)
+            snap_after_else = self._snapshot()
+            # herstel naar voor-else
+            self.known_values = dict(snap_before_else)
+        else:
+            snap_after_else = snap_before_then  # geen else → alsof er niets veranderd is
+
+        # invalideer alles wat in then OF else mogelijk veranderd is
+        # We doen dit door te kijken wat ná then of ná else anders is
+        # dan vóór het if-statement (= snap_before_then).
+        snap_before_if = snap_before_then
+        for name in list(self.known_values.keys()):
+            if self.is_const.get(name, False):
+                continue
+            val_before = snap_before_if.get(name)
+            val_after_then = snap_after_then.get(name)
+            val_after_else = snap_after_else.get(name)
+            # als de waarde in een van de takken veranderd kan zijn → invalideer
+            if val_after_then != val_before or val_after_else != val_before:
+                del self.known_values[name]
+
+        return IfNode(new_condition, new_then, new_else)
+
+    def visitWhile(self, node):
+        """
+        Vouw de conditie. De body behandelen we conservatief:
+        we veronderstellen dat ALLE niet-const variabelen die in de
+        body veranderd worden, na de lus onbekend zijn.
+
+        WAAROM niet propageren door lussen?
+          int x = 0;
+          while (x < 10) { x = x + 1; }
+          // hier weten we NIET wat x is na de lus (runtime bepaalt dit)
+
+        AANPAK: snapshot vóór de body → bezoek → invalideer wat veranderd is.
+
+        EDGE CASE: de conditie wordt gevouwen MET de waarden van VÓÓR de lus.
+        Dit is correct: de eerste evaluatie van de conditie gebruikt die waarden.
+        Maar de conditie kan ook veranderen tijdens de lus (x verandert) —
+        dat is runtime logica die we hier niet kunnen volgen.
+
+        EDGE CASE: WhileNode.update (voor for-lussen) wordt ook gevouwen.
+        """
+        # snapshot vóór de lus
+        snap_before = self._snapshot()
+
+        # STAP 1: verzamel alle vars die in de body (en update) geassigned worden
+        modified = self._collect_assigned_vars(node.body)
+        if node.update is not None:
+            modified |= self._collect_assigned_vars(node.update)
+
+        # STAP 2: verwijder die vars UIT known_values VÓÓR het vouwen van de conditie.
+        # Zo wordt x < 10 NIET gevouwen naar 1 alleen omdat x = 8 vóór de lus bekend was.
+        # Consts en enum labels (is_const=True) blijven altijd staan.
+        for name in modified:
+            if not self.is_const.get(name, False):
+                self.known_values.pop(name, None)
+
+        # STAP 3: vouw de conditie (x is nu onbekend -> blijft als expressie staan)
+        new_condition = node.condition.accept(self)
+
+        # STAP 4: vouw de body
+        new_body = node.body.accept(self)
+
+        # STAP 5: vouw de update expressie (kan None zijn)
+        new_update = node.update.accept(self) if node.update is not None else None
+
+        # STAP 6: invalideer wat in de body veranderd kan zijn (voor na de lus)
+        self._invalidate_changed(snap_before)
+
+        return WhileNode(new_condition, new_body, new_update)
+
+    def visitBreak(self, node):
+        """Break nodes worden ongewijzigd doorgegeven."""
+        return node
+
+    def visitContinue(self, node):
+        """Continue nodes worden ongewijzigd doorgegeven."""
+        return node
+
+    def visitScope(self, node):
+        """
+        Anonieme scope: behandel als een blok met eigen known_values scope.
+        Variabelen gedeclareerd IN de scope zijn daarna niet meer zichtbaar.
+
+        EDGE CASE: variabelen van BUITEN de scope kunnen WEL gelezen worden
+        (propagation van buiten naar binnen is OK), maar wijzigingen van
+        BINNEN invalideren ze voor gebruik BUITEN.
+        """
+        snap_before = self._snapshot()
+        new_body = node.body.accept(self)
+        self._invalidate_changed(snap_before)
+        return ScopeNode(new_body)
+
+    # ============================================================
+    # DECLARATIES EN ASSIGNMENTS (ongewijzigd van assignment 3)
+    # ============================================================
+
     def visitVarDecl(self, node):
         if node.value is not None:
             new_value = node.value.accept(self)
         else:
             new_value = None
 
+        # impliciete float conversie: int literal in float variabele
         if (isinstance(new_value, LiteralNode)
                 and node.var_type.base_type == 'float'
                 and new_value.type_name == 'int'):
@@ -85,88 +349,40 @@ class ConstantFoldingVisitor:
         return AssignNode(node.target, new_value)
 
     # ============================================================
-    # NIEUW: ARRAY NODES
+    # ARRAY NODES (ongewijzigd van assignment 3)
     # ============================================================
 
     def visitArrayDecl(self, node):
-        """
-        Array declaraties kunnen we niet als geheel vouwen, maar de
-        expressies IN de initialisator wel.
-
-        Voorbeeld:
-          int arr[3] = {1+2, x, 5*1};
-          → als x bekend is: {3, x_waarde, 5}
-          → als x onbekend is: {3, x, 5}
-
-        BELANGRIJK: arrays komen NIET in known_values terecht.
-        Constant propagation voor array elementen is te complex
-        (we weten niet welk element op runtime gebruikt wordt).
-        """
         if node.initializer is not None:
             new_init = node.initializer.accept(self)
         else:
             new_init = None
-
         return ArrayDeclNode(node.var_type, node.name, node.dimensions, new_init)
 
     def visitArrayInit(self, node):
-        """
-        Vouw de expressies in een array initialisator.
-        Geneste ArrayInitNodes worden ook recursief gevouwen.
-        """
-        new_elements = []
-        for elem in node.elements:
-            new_elements.append(elem.accept(self))
+        new_elements = [elem.accept(self) for elem in node.elements]
         return ArrayInitNode(new_elements)
 
     def visitArrayAccess(self, node):
-        """
-        Array toegang: vouw de index expressie als mogelijk.
-        Voorbeeld: arr[2+1]  →  arr[3]
-
-        We vouwen de array_expr en index beide, maar het resultaat
-        is altijd een ArrayAccessNode — we kunnen niet op compile-time
-        bepalen wat de waarde van arr[i] is.
-        """
         new_array_expr = node.array_expr.accept(self)
         new_index      = node.index.accept(self)
         return ArrayAccessNode(new_array_expr, new_index)
 
     # ============================================================
-    # NIEUW: COMMENT, INCLUDE, STRING, FUNCTIONCALL
+    # COMMENT, INCLUDE, STRING, FUNCTIONCALL (ongewijzigd)
     # ============================================================
 
     def visitComment(self, node):
-        """
-        Comments worden ongewijzigd doorgegeven.
-        Er valt niets te vouwen in een comment.
-        """
         return node
 
     def visitInclude(self, node):
-        """
-        Include nodes worden ongewijzigd doorgegeven.
-        """
         return node
 
     def visitStringLiteral(self, node):
-        """
-        String literals worden ongewijzigd doorgegeven.
-        Een string is al zo simpel als het kan.
-        """
         return node
 
     def visitFunctionCall(self, node):
-        """
-        Functie-aanroepen kunnen we niet vouwen (we kennen de return waarde
-        niet op compile-time), maar de argumenten WEL.
-
-        Voorbeeld:
-          printf("%d\n", 3 + 4)  →  printf("%d\n", 7)
-        """
-        new_args = []
-        for arg in node.args:
-            new_args.append(arg.accept(self))
+        new_args = [arg.accept(self) for arg in node.args]
         return FunctionCallNode(node.name, new_args)
 
     # ============================================================
@@ -174,12 +390,21 @@ class ConstantFoldingVisitor:
     # ============================================================
 
     def visitVariable(self, node):
+        """
+        Vervang variabelen door hun bekende waarde als die beschikbaar is.
+
+        NIEUW: enum labels staan ook in known_values (als const int),
+        dus READY wordt automatisch gevouwen naar LiteralNode(0, 'int').
+
+        EDGE CASE: als de variabele niet in known_values staat,
+        geven we de VariableNode ongewijzigd terug.
+        """
         if node.name in self.known_values:
             return self.known_values[node.name]
         return node
 
     # ============================================================
-    # EXPRESSIES: folding (ongewijzigd van assignment 2)
+    # EXPRESSIES: folding (ongewijzigd van assignment 2/3)
     # ============================================================
 
     def visitLiteral(self, node):
@@ -193,51 +418,51 @@ class ConstantFoldingVisitor:
             l = left.value
             r = right.value
 
-            if node.op == '+':
-                resultaat = l + r
-            elif node.op == '-':
-                resultaat = l - r
-            elif node.op == '*':
-                resultaat = l * r
-            elif node.op == '/':
-                if r == 0:
-                    raise ZeroDivisionError(f"Deling door nul: {l} / {r}")
-                if left.type_name == 'int' and right.type_name == 'int':
-                    resultaat = l // r
+            try:
+                if node.op == '+':
+                    resultaat = l + r
+                elif node.op == '-':
+                    resultaat = l - r
+                elif node.op == '*':
+                    resultaat = l * r
+                elif node.op == '/':
+                    if r == 0:
+                        return BinaryOpNode(node.op, left, right)
+                    resultaat = l // r if (left.type_name == 'int' and right.type_name == 'int') else l / r
+                elif node.op == '%':
+                    if r == 0:
+                        return BinaryOpNode(node.op, left, right)
+                    resultaat = l % r
+                elif node.op == '==':
+                    resultaat = int(l == r)
+                elif node.op == '!=':
+                    resultaat = int(l != r)
+                elif node.op == '<':
+                    resultaat = int(l < r)
+                elif node.op == '>':
+                    resultaat = int(l > r)
+                elif node.op == '<=':
+                    resultaat = int(l <= r)
+                elif node.op == '>=':
+                    resultaat = int(l >= r)
+                elif node.op == '&&':
+                    resultaat = int(bool(l) and bool(r))
+                elif node.op == '||':
+                    resultaat = int(bool(l) or bool(r))
+                elif node.op == '&':
+                    resultaat = l & r
+                elif node.op == '|':
+                    resultaat = l | r
+                elif node.op == '^':
+                    resultaat = l ^ r
+                elif node.op == '<<':
+                    resultaat = l << r
+                elif node.op == '>>':
+                    resultaat = l >> r
                 else:
-                    resultaat = l / r
-            elif node.op == '%':
-                if r == 0:
-                    raise ZeroDivisionError(f"Modulo door nul: {l} % {r}")
-                resultaat = l % r
-            elif node.op == '==':
-                resultaat = int(l == r)
-            elif node.op == '!=':
-                resultaat = int(l != r)
-            elif node.op == '<':
-                resultaat = int(l < r)
-            elif node.op == '>':
-                resultaat = int(l > r)
-            elif node.op == '<=':
-                resultaat = int(l <= r)
-            elif node.op == '>=':
-                resultaat = int(l >= r)
-            elif node.op == '&&':
-                resultaat = int(bool(l) and bool(r))
-            elif node.op == '||':
-                resultaat = int(bool(l) or bool(r))
-            elif node.op == '&':
-                resultaat = l & r
-            elif node.op == '|':
-                resultaat = l | r
-            elif node.op == '^':
-                resultaat = l ^ r
-            elif node.op == '<<':
-                resultaat = l << r
-            elif node.op == '>>':
-                resultaat = l >> r
-            else:
-                raise ValueError(f"Onbekende operator: {node.op}")
+                    return BinaryOpNode(node.op, left, right)
+            except Exception:
+                return BinaryOpNode(node.op, left, right)
 
             result_type = 'float' if (left.type_name == 'float' or right.type_name == 'float') else 'int'
             return LiteralNode(resultaat, result_type)
@@ -247,7 +472,7 @@ class ConstantFoldingVisitor:
     def visitUnaryOp(self, node):
         operand = node.operand.accept(self)
 
-        # ++ en -- hebben side effects → niet folden
+        # ++ en -- hebben side effects → niet folden, wel known_values invalideren
         if node.op in ('prefix++', 'prefix--', 'suffix++', 'suffix--'):
             if isinstance(node.operand, VariableNode):
                 self.known_values.pop(node.operand.name, None)
@@ -255,25 +480,22 @@ class ConstantFoldingVisitor:
 
         if isinstance(operand, LiteralNode):
             v = operand.value
-
-            if node.op == '-':
-                resultaat = -v
-            elif node.op == '+':
-                resultaat = +v
-            elif node.op == '!':
-                resultaat = int(not bool(v))
-            elif node.op == '~':
-                resultaat = ~v
-            elif node.op == '&':
-                # address-of: gebruik de ORIGINELE operand, niet de gepropageerde waarde.
-                # &x moet het adres van x zelf teruggeven, niet &5 als x=5 bekend is.
-                return UnaryOpNode('&', node.operand)
-            elif node.op == '*':
-                return UnaryOpNode('*', operand)
-            else:
-                raise ValueError(f"Onbekende unaire operator: {node.op}")
-
-            return LiteralNode(resultaat, operand.type_name)
+            try:
+                if node.op == '-':
+                    return LiteralNode(-v, operand.type_name)
+                elif node.op == '+':
+                    return LiteralNode(+v, operand.type_name)
+                elif node.op == '!':
+                    return LiteralNode(int(not bool(v)), 'int')
+                elif node.op == '~':
+                    return LiteralNode(~v, operand.type_name)
+                elif node.op == '&':
+                    # address-of: gebruik originele operand, niet de gepropageerde waarde
+                    return UnaryOpNode('&', node.operand)
+                elif node.op == '*':
+                    return UnaryOpNode('*', operand)
+            except Exception:
+                pass
 
         return UnaryOpNode(node.op, operand)
 
@@ -282,13 +504,15 @@ class ConstantFoldingVisitor:
 
         if isinstance(operand, LiteralNode):
             target = node.target_type.base_type
-
-            if target == 'int':
-                return LiteralNode(int(operand.value), 'int')
-            elif target == 'float':
-                return LiteralNode(float(operand.value), 'float')
-            elif target == 'char':
-                return LiteralNode(chr(int(operand.value)), 'char')
+            try:
+                if target == 'int':
+                    return LiteralNode(int(operand.value), 'int')
+                elif target == 'float':
+                    return LiteralNode(float(operand.value), 'float')
+                elif target == 'char':
+                    return LiteralNode(chr(int(operand.value)), 'char')
+            except Exception:
+                pass
 
         return CastNode(node.target_type, operand)
 

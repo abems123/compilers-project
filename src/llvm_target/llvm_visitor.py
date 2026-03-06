@@ -6,7 +6,9 @@ from ..parser.ast_nodes import (
     CastNode, TypeNode, BlockNode, ProgramNode,
     CommentNode, ArrayDeclNode, ArrayInitNode,
     ArrayAccessNode, StringLiteralNode,
-    FunctionCallNode, IncludeNode
+    FunctionCallNode, IncludeNode,
+    # NIEUW — assignment 4:
+    EnumDefNode, IfNode, WhileNode, BreakNode, ContinueNode, ScopeNode
 )
 
 
@@ -29,14 +31,19 @@ class LLVMVisitor:
     """
 
     def __init__(self):
-        self.globals      = []        # globale string constanten
-        self.func_decls   = set()     # printf / scanf declaraties nodig?
-        self.instructions = []        # instructies in de main body
-        self.reg_counter  = 0         # teller voor %t0, %t1, ...
-        self.str_counter  = 0         # teller voor @.str.0, @.str.1, ...
-        self.string_cache = {}        # raw_value → global_name (geen duplicaten)
-        self.var_info     = {}        # naam → dict met type info
-        self.stdio_included = False
+        self.globals            = []        # globale string constanten
+        self.func_decls         = set()     # printf / scanf declaraties nodig?
+        self.instructions       = []        # instructies in de main body
+        self.reg_counter        = 0         # teller voor %t0, %t1, ...
+        self.str_counter        = 0         # teller voor @.str.0, @.str.1, ...
+        self.string_cache       = {}        # raw_value → global_name (geen duplicaten)
+        self.var_info           = {}        # naam → dict met type info
+        self.stdio_included     = False
+        self.label_counter      = 0    # unieke teller voor if/while labels
+        self.loop_stack         = []   # stack van (break_label, continue_label)
+        self._block_terminated  = False  # True na br/ret → geen dubbele terminator
+        self.scope_stack        = [{}]   # stack van {original_name: llvm_name} per scope
+        self.name_counter       = {}     # original_name → aantal keer gedeclareerd (voor unieke namen)
 
     # ============================================================
     # HELPERS: registers, types, strings
@@ -245,6 +252,46 @@ class LLVMVisitor:
         return reg
 
     # ============================================================
+    # SHADOWING HELPERS
+    # ============================================================
+
+    def _get_unique_llvm_name(self, name: str) -> str:
+        """
+        Geeft een unieke LLVM naam terug voor een variabele declaratie.
+
+        Als 'name' nog niet bestaat → gebruik 'name' direct.
+        Als 'name' al bestaat (shadowing in inner scope) → gebruik 'name.1', 'name.2', ...
+
+        Voorbeeld:
+          buitenste scope: int x  → llvm_name = 'x'
+          binnenste scope: int x  → llvm_name = 'x.1'
+          nog een scope:   int x  → llvm_name = 'x.2'
+        """
+        if name not in self.var_info:
+            return name
+        count = self.name_counter.get(name, 0) + 1
+        self.name_counter[name] = count
+        return f"{name}.{count}"
+
+    def _lookup_llvm_name(self, name: str) -> str:
+        """
+        Zoek de huidige actieve LLVM naam voor een variabele.
+
+        Doorzoekt de scope_stack van binnen naar buiten.
+        De binnenste scope wint (shadowing).
+
+        Voorbeeld:
+          buitenste scope heeft x → 'x'
+          binnenste scope heeft x → 'x.1'
+          → binnen de binnenste scope geeft dit 'x.1' terug
+          → buiten de binnenste scope geeft dit 'x' terug
+        """
+        for scope in reversed(self.scope_stack):
+            if name in scope:
+                return scope[name]
+        return name  # fallback
+
+    # ============================================================
     # ADRES BEREKENING (voor lvalues)
     # ============================================================
 
@@ -259,13 +306,14 @@ class LLVMVisitor:
           UnaryOpNode('*')   → de waarde van de pointer IS het adres
         """
         if isinstance(node, VariableNode):
-            info = self.var_info[node.name]
+            llvm_name = self._lookup_llvm_name(node.name)
+            info = self.var_info[llvm_name]
             if info['is_array']:
                 array_t = self.llvm_array_type(info['base_type'], info['dimensions'])
-                return (f"%{node.name}", f"{array_t}*")
+                return (f"%{llvm_name}", f"{array_t}*")
             else:
                 llvm_t = self.llvm_type(info['base_type'], info['pointer_depth'])
-                return (f"%{node.name}", f"{llvm_t}*")
+                return (f"%{llvm_name}", f"{llvm_t}*")
 
         elif isinstance(node, ArrayAccessNode):
             return self._get_array_element_address(node)
@@ -337,8 +385,12 @@ class LLVMVisitor:
             self.stdio_included = True
 
     def visitBlock(self, node):
+        self.scope_stack.append({})
         for stmt in node.statements:
+            if self._block_terminated:
+                break
             stmt.accept(self)
+        self.scope_stack.pop()
 
     def visitComment(self, node):
         self.emit_comment(node.text)
@@ -354,28 +406,32 @@ class LLVMVisitor:
         EDGE CASE: char* s = "hello" → alloca i8*, store i8* (GEP van global)
         EDGE CASE: impliciete type conversie bij initialisatie (float → int, enz.)
         """
-        name  = node.name
-        base  = node.var_type.base_type
-        depth = node.var_type.pointer_depth
-        llvm_t = self.llvm_type(base, depth)
+        name     = node.name
+        base     = node.var_type.base_type
+        depth    = node.var_type.pointer_depth
+        llvm_t   = self.llvm_type(base, depth)
 
-        # sla type info op voor later gebruik
-        self.var_info[name] = {
-            'base_type':    base,
+        # unieke LLVM naam bij shadowing (x → x.1 als x al bestaat)
+        llvm_name = self._get_unique_llvm_name(name)
+        self.scope_stack[-1][name] = llvm_name  # registreer in huidige scope
+
+        # sla type info op onder de unieke naam
+        self.var_info[llvm_name] = {
+            'base_type':     base,
             'pointer_depth': depth,
-            'is_array':     False,
-            'dimensions':   [],
-            'llvm_type':    llvm_t
+            'is_array':      False,
+            'dimensions':    [],
+            'llvm_type':     llvm_t
         }
 
-        # alloca
-        self.emit(f"%{name} = alloca {llvm_t}")
+        # alloca met unieke naam
+        self.emit(f"%{llvm_name} = alloca {llvm_t}")
 
         # store initialisatiewaarde als die er is
         if node.value is not None:
             val, val_type = node.value.accept(self)
             val = self._coerce(val, val_type, llvm_t)
-            self.emit(f"store {llvm_t} {val}, {llvm_t}* %{name}")
+            self.emit(f"store {llvm_t} {val}, {llvm_t}* %{llvm_name}")
 
     def visitArrayDecl(self, node):
         """
@@ -513,18 +569,19 @@ class LLVMVisitor:
         → dit is semantisch ongeldig, de semantic analysis heeft het al gemeld.
         We geven een nul terug als fallback.
         """
-        info = self.var_info.get(node.name)
+        llvm_name = self._lookup_llvm_name(node.name)
+        info = self.var_info.get(llvm_name)
         if info is None:
             return ('0', 'i32')  # zou na semantic analysis niet mogen voorkomen
 
         if info['is_array']:
             # array als expressie → geef de pointer terug (bv. voor &arr)
             arr_t = self.llvm_array_type(info['base_type'], info['dimensions'])
-            return (f"%{node.name}", f"{arr_t}*")
+            return (f"%{llvm_name}", f"{arr_t}*")
 
         llvm_t = self.llvm_type(info['base_type'], info['pointer_depth'])
         reg    = self.new_reg()
-        self.emit(f"{reg} = load {llvm_t}, {llvm_t}* %{node.name}")
+        self.emit(f"{reg} = load {llvm_t}, {llvm_t}* %{llvm_name}")
         return (reg, llvm_t)
 
     def visitArrayAccess(self, node) -> tuple:
@@ -744,3 +801,280 @@ class LLVMVisitor:
     def visitType(self, node):
         # TypeNode bevat geen code → niets te genereren
         return None
+
+    def new_label(self, prefix: str) -> str:
+        """
+        Genereert een uniek LLVM label: prefix.N
+
+        Elke aanroep verhoogt de globale teller, ook voor dezelfde prefix.
+        Zo zijn labels nooit gelijk, ook niet bij geneste if/while.
+
+        Voorbeelden:
+          new_label("if.then")    → "if.then.0"
+          new_label("while.cond") → "while.cond.1"
+          new_label("if.then")    → "if.then.2"
+        """
+        lbl = f"{prefix}.{self.label_counter}"
+        self.label_counter += 1
+        return lbl
+
+    def emit_label(self, name: str):
+        """
+        Emitteer een LLVM label-definitie (zonder inspringing).
+        Reset _block_terminated zodat we daarna weer instructies kunnen emitteren.
+
+          while.cond.0:
+        """
+        self.instructions.append(f"{name}:")
+        self._block_terminated = False
+
+    def emit_br(self, target: str):
+        """
+        Onvoorwaardelijke sprong: br label %target
+
+        EDGE CASE: als het blok al afgesloten is (na break/continue/een
+        eerdere br), emitteren we NIETS — anders twee terminators in één blok.
+        """
+        if not self._block_terminated:
+            self.emit(f"br label %{target}")
+            self._block_terminated = True
+
+    def emit_cond_br(self, cond_reg: str, true_lbl: str, false_lbl: str):
+        """
+        Voorwaardelijke sprong: br i1 %cond, label %true, label %false
+
+        Zelfde dead-code bescherming als emit_br.
+        """
+        if not self._block_terminated:
+            self.emit(f"br i1 {cond_reg}, label %{true_lbl}, label %{false_lbl}")
+            self._block_terminated = True
+
+    def _to_bool(self, val: str, val_type: str) -> str:
+        """
+        Zet een LLVM waarde om naar i1 voor gebruik in 'br i1 ...'.
+
+        In C is elke niet-nul waarde 'true':
+          int/i8 → icmp ne <type> val, 0
+          float  → fcmp one float val, 0.0   (ordered not-equal)
+        """
+        reg = self.new_reg()
+        if val_type == 'float':
+            self.emit(f"{reg} = fcmp one float {val}, 0.0")
+        else:
+            self.emit(f"{reg} = icmp ne {val_type} {val}, 0")
+        return reg
+
+    def visitProgram(self, node) -> str:
+        """
+        UITGEBREID: verwerkt nu ook node.enums vóór de body.
+
+        Enums hoeven geen LLVM code te genereren — de constant folding
+        visitor heeft alle enum labels al omgezet naar LiteralNodes.
+        """
+        for inc in node.includes:
+            inc.accept(self)
+
+        for enum in node.enums:
+            enum.accept(self)
+
+        node.body.accept(self)
+
+        return self.finalize()
+
+    def visitBlock(self, node):
+        """
+        UITGEBREID: stopt zodra het blok afgesloten is (dead code na break/continue).
+
+        EDGE CASE: break of continue midden in een blok zet _block_terminated=True.
+        De rest van het blok is dan dead code en wordt overgeslagen.
+        """
+        for stmt in node.statements:
+            if self._block_terminated:
+                break
+            stmt.accept(self)
+
+    def visitEnumDef(self, node):
+        """
+        Enum definities genereren geen LLVM code.
+
+        Alle enum labels zijn door constant folding al omgezet naar
+        LiteralNode(0), LiteralNode(1), enz. in alle expressies.
+        """
+        pass
+
+    def visitScope(self, node):
+        """
+        Anonieme scope: bezoek gewoon de body.
+
+        Scoping is een compile-time concept — LLVM IR kent geen scopes.
+        Variabelen krijgen gewoon een alloca in de main body, net als alle
+        andere variabelen. Naamconflicten zijn al afgehandeld door de
+        semantic analysis.
+        """
+        node.body.accept(self)
+
+    def visitIf(self, node):
+        """
+        Genereer LLVM IR voor if / if-else / else-if.
+
+        STRUCTUUR zonder else:
+          %cond = icmp ne i32 %val, 0
+          br i1 %cond, label %if.then.0, label %if.end.1
+        if.then.0:
+          ; body
+          br label %if.end.1
+        if.end.1:
+
+        STRUCTUUR met else:
+          br i1 %cond, label %if.then.0, label %if.else.2
+        if.then.0:
+          ; then body
+          br label %if.end.1
+        if.else.2:
+          ; else body  (of geneste IfNode voor else-if)
+          br label %if.end.1
+        if.end.1:
+
+        EDGE CASE: else_block kan een IfNode zijn → visitIf wordt recursief
+          aangeroepen, labels blijven uniek dankzij de globale label_counter.
+        EDGE CASE: break/continue in een tak zet _block_terminated=True →
+          emit_br(end_label) emitteert de sprong dan NIET (geen dubbele terminator).
+        EDGE CASE: lege body → visitBlock doet niets, emit_br sluit af.
+        """
+        # evalueer conditie
+        cond_val, cond_type = node.condition.accept(self)
+        cond_reg = self._to_bool(cond_val, cond_type)
+
+        then_lbl = self.new_label("if.then")
+        end_lbl = self.new_label("if.end")
+
+        if node.else_block is not None:
+            else_lbl = self.new_label("if.else")
+            self.emit_cond_br(cond_reg, then_lbl, else_lbl)
+        else:
+            self.emit_cond_br(cond_reg, then_lbl, end_lbl)
+
+        # then-tak
+        self.emit_label(then_lbl)
+        node.then_block.accept(self)
+        self.emit_br(end_lbl)
+
+        # else-tak
+        if node.else_block is not None:
+            self.emit_label(else_lbl)
+            node.else_block.accept(self)  # BlockNode of IfNode
+            self.emit_br(end_lbl)
+
+        self.emit_label(end_lbl)
+
+    def visitWhile(self, node):
+        """
+        Genereer LLVM IR voor while (en for→while vertaling).
+
+        STRUCTUUR gewone while:
+          br label %while.cond.0
+        while.cond.0:
+          %cond = icmp ne i32 %val, 0
+          br i1 %cond, label %while.body.1, label %while.end.2
+        while.body.1:
+          ; body
+          br label %while.cond.0
+        while.end.2:
+
+        STRUCTUUR for-lus (node.update aanwezig):
+          br label %while.cond.0
+        while.cond.0:
+          br i1 %cond, label %while.body.1, label %while.end.2
+        while.body.1:
+          ; body statements (ZONDER de update — die staat in node.update)
+          br label %while.update.3
+        while.update.3:
+          ; update expressie (bv. i + 1, i++)
+          br label %while.cond.0
+        while.end.2:
+
+        LOOP STACK: (end_label, continue_target)
+          - break    → spring naar end_label
+          - continue → spring naar continue_target
+                       = while.cond  voor gewone while
+                       = while.update voor for-lus
+
+        EDGE CASE: break/continue in geneste loops → loop_stack[-1] is de
+          binnenste lus, break/continue horen altijd bij de binnenste.
+        EDGE CASE: dead code na break in body → _block_terminated=True,
+          emit_br(update/cond) wordt overgeslagen door emit_br check.
+        EDGE CASE: while(1) → cond is LiteralNode(1) → icmp ne i32 1, 0
+          → altijd true → oneindige lus (verwacht, geldig).
+        """
+        cond_lbl = self.new_label("while.cond")
+        body_lbl = self.new_label("while.body")
+        end_lbl = self.new_label("while.end")
+
+        if node.update is not None:
+            upd_lbl = self.new_label("while.update")
+            continue_target = upd_lbl
+        else:
+            upd_lbl = None
+            continue_target = cond_lbl
+
+        # sluit het huidige blok af en spring naar conditie
+        self.emit_br(cond_lbl)
+
+        # ── conditie ──────────────────────────────────────────────
+        self.emit_label(cond_lbl)
+        cond_val, cond_type = node.condition.accept(self)
+        cond_reg = self._to_bool(cond_val, cond_type)
+        self.emit_cond_br(cond_reg, body_lbl, end_lbl)
+
+        # ── body ──────────────────────────────────────────────────
+        self.emit_label(body_lbl)
+        self.loop_stack.append((end_lbl, continue_target))
+
+        if node.update is not None:
+            # de update staat als laatste statement in node.body (toegevoegd
+            # door de CST→AST visitor). We emitteren de body ZONDER dat
+            # laatste statement, zodat continue via het update-label loopt.
+            for stmt in node.body.statements[:-1]:
+                if self._block_terminated:
+                    break
+                stmt.accept(self)
+        else:
+            node.body.accept(self)
+
+        self.loop_stack.pop()
+
+        # ── update (alleen voor for-lussen) ───────────────────────
+        if node.update is not None:
+            self.emit_br(upd_lbl)
+            self.emit_label(upd_lbl)
+            node.update.accept(self)  # resultaat wordt weggegooid
+
+        # terug naar conditie
+        self.emit_br(cond_lbl)
+
+        # ── exit ──────────────────────────────────────────────────
+        self.emit_label(end_lbl)
+
+    def visitContinue(self, node):
+        """
+        Genereer een sprong naar het continue-target van de dichtstbijzijnde lus.
+
+        - Gewone while: spring naar while.cond
+        - For-lus:      spring naar while.update (voer update uit vóór conditie)
+
+        Leest loop_stack[-1][1] (= continue_label).
+        """
+        if self.loop_stack:
+            _, cont_lbl = self.loop_stack[-1]
+            self.emit_br(cont_lbl)
+
+    def visitBreak(self, node):
+        """
+        Genereer een sprong naar het exit-label van de dichtstbijzijnde lus/switch.
+
+        Leest loop_stack[-1][0] (= break_label).
+        emit_br beschermt tegen dubbele terminators.
+        """
+        if self.loop_stack:
+            break_lbl, _ = self.loop_stack[-1]
+            self.emit_br(break_lbl)

@@ -5,10 +5,13 @@ from .ast_nodes import (
     LiteralNode, BinaryOpNode, UnaryOpNode,
     VariableNode, VarDeclNode, AssignNode,
     CastNode, TypeNode, BlockNode, ProgramNode,
-    # Nieuw in assignment 3:
+    # Assignment 3:
     CommentNode, ArrayDeclNode, ArrayInitNode,
     ArrayAccessNode, StringLiteralNode,
-    FunctionCallNode, IncludeNode
+    FunctionCallNode, IncludeNode,
+    # Assignment 4 (nieuw):
+    EnumDefNode, IfNode, WhileNode,
+    BreakNode, ContinueNode, ScopeNode
 )
 
 
@@ -19,84 +22,88 @@ class CSTtoASTVisitor(ParseTreeVisitor):
     Elke methode hier komt overeen met één grammar regel.
     Naamconventie: visit + (naam van de grammar regel met hoofdletter).
 
-    Assignment 3 voegt toe:
-      - visitProgram     : leest nu ook de includeStmt* kinderen
-      - visitStatement   : herkent arrayDec, functionCall SC, comment
-      - visitIncludeStmt : #include <stdio.h> → IncludeNode
-      - visitArrayDec    : array declaratie → ArrayDeclNode
-      - visitArrayInit   : { ... } → ArrayInitNode
-      - visitArrayElement: expressie of geneste { ... }
-      - visitFunctionCall: printf(...) → FunctionCallNode
-      - visitComment     : // of /* */ → CommentNode
-      - visitExpression  : uitgebreid met array toegang, STRING, functionCall
+    Assignment 4 voegt toe:
+      - visitProgram     : leest nu ook de enumDef* kinderen vóór main
+      - visitStatement   : herkent if, while, for, break, continue, switch, scope
+      - visitEnumDef     : enum definitie → EnumDefNode
+      - visitIfStmt      : if/else/else-if → IfNode
+      - visitWhileStmt   : while → WhileNode
+      - visitForStmt     : for → VarDecl/Assign + WhileNode (vertaling!)
+      - visitBreakStmt   : break → BreakNode
+      - visitContinueStmt: continue → ContinueNode
+      - visitSwitchStmt  : switch → IfNode keten (vertaling!)
+      - visitScopeStmt   : anonieme scope → ScopeNode
+      - visitType        : uitgebreid met enum type
     """
 
+    def __init__(self):
+        self.errors = []
+
     # --------------------------------------------------------
-    # visitProgram: de startegel van de grammar
+    # visitProgram
     # --------------------------------------------------------
-    # Grammar: program : (includeStmt | comment)* INT_KW MAIN LPAREN RPAREN block EOF
+    # Grammar: program : (includeStmt | comment | enumDef)* INT_KW MAIN ... block EOF
     #
-    # We itereren over alle kinderen vóór 'int' om includes én comments
-    # te verzamelen. ctx.includeStmt() en ctx.comment() geven lijsten terug
-    # van elk type apart — maar de VOLGORDE gaat verloren als we ze apart
-    # itereren.
+    # NIEUW in assignment 4: enumDef* kinderen vóór main worden verzameld
+    # en apart opgeslagen in ProgramNode.enums.
     #
-    # KEUZE: we bewaren includes apart (voor stdio check) en top-level
-    # comments apart. Volgorde maakt voor de compiler niet uit.
-    #
-    # EDGE CASE: ctx.includeStmt() geeft een lege lijst als er geen includes zijn.
-    # ctx.comment() geeft een lege lijst als er geen top-level comments zijn.
+    # EDGE CASE: ctx.enumDef() geeft een lege lijst als er geen enums zijn.
+    # EDGE CASE: de volgorde van includes/comments/enums in de broncode
+    # is niet relevant voor de compiler — we bewaren ze apart per type.
     def visitProgram(self, ctx):
-        # verzamel alle include nodes
+        # verzamel includes
         includes = []
         for inc_ctx in ctx.includeStmt():
             includes.append(self.visit(inc_ctx))
 
-        # verzamel top-level comments (vóór int main)
-        # die worden ook als statements in de body gezet zodat de
-        # LLVM visitor ze kan verwerken
+        # verzamel top-level comments
         top_comments = []
         for cmt_ctx in ctx.comment():
             top_comments.append(self.visit(cmt_ctx))
 
-        # bezoek de block (de body van main)
+        # NIEUW: verzamel enum definities
+        enums = []
+        for enum_ctx in ctx.enumDef():
+            enums.append(self.visit(enum_ctx))
+
+        # bezoek de block (body van main)
         block = self.visit(ctx.block())
 
-        # voeg top-level comments toe aan het begin van de block statements
-        # zodat ze zichtbaar zijn in de AST en later in LLVM output
+        # top-level comments aan het begin van de block statements
         if top_comments:
             block.statements = top_comments + block.statements
 
-        return ProgramNode(block, includes)
+        return ProgramNode(block, includes, enums)
 
     # --------------------------------------------------------
-    # visitIncludeStmt: #include <stdio.h>
+    # visitEnumDef (NIEUW)
     # --------------------------------------------------------
-    # Grammar: includeStmt : INCLUDE_STDIO
+    # Grammar: enumDef : ENUM_KW ID LBRACE ID (COMMA ID)* RBRACE SC
     #
-    # Het INCLUDE_STDIO token matcht de hele tekst '#include <stdio.h>'.
-    # We extraheren de headernaam 'stdio.h' eruit voor de IncludeNode.
+    # De eerste ID is de naam van de enum (bv. 'Status').
+    # Alle overige IDs zijn de labels (bv. ['READY', 'BUSY', 'OFFLINE']).
     #
-    # EDGE CASE: we parsen de headernaam dynamisch uit de token tekst
-    # zodat we later eventueel andere includes kunnen toevoegen zonder
-    # de grammar te hoeven aanpassen.
+    # EDGE CASE: ctx.ID() geeft een LIJST van alle ID-tokens terug.
+    # Het EERSTE element is de enum naam, de REST zijn de labels.
+    def visitEnumDef(self, ctx):
+        all_ids = ctx.ID()                      # lijst van alle ID tokens
+        name    = all_ids[0].getText()          # eerste ID = enum naam
+        labels  = [id_.getText() for id_ in all_ids[1:]]  # rest = labels
+        return EnumDefNode(name, labels)
+
+    # --------------------------------------------------------
+    # visitIncludeStmt (ongewijzigd van assignment 3)
+    # --------------------------------------------------------
     def visitIncludeStmt(self, ctx):
-        # ctx.INCLUDE_STDIO() geeft het token, .getText() geeft bv. '#include <stdio.h>'
         token_text = ctx.INCLUDE_STDIO().getText()
-
-        # extract de headernaam: alles tussen '<' en '>'
-        # '#include <stdio.h>' → 'stdio.h'
-        start = token_text.index('<') + 1
-        end   = token_text.index('>')
+        start  = token_text.index('<') + 1
+        end    = token_text.index('>')
         header = token_text[start:end]
-
         return IncludeNode(header)
 
     # --------------------------------------------------------
-    # visitBlock: een blok van statements
+    # visitBlock (ongewijzigd)
     # --------------------------------------------------------
-    # Grammar: block : LBRACE (statement)* RBRACE
-    # Ongewijzigd van assignment 2.
     def visitBlock(self, ctx):
         statements = []
         for stmt_ctx in ctx.statement():
@@ -105,56 +112,374 @@ class CSTtoASTVisitor(ParseTreeVisitor):
         return BlockNode(statements)
 
     # --------------------------------------------------------
-    # visitStatement: één statement
+    # visitStatement (uitgebreid)
     # --------------------------------------------------------
     # Grammar:
-    #   statement : varDec
-    #             | arrayDec          ← NIEUW
-    #             | varAss
-    #             | functionCall SC   ← NIEUW
-    #             | expression SC
-    #             | comment           ← NIEUW
+    #   statement : varDec | arrayDec | varAss | functionCall SC
+    #             | expression SC | comment
+    #             | ifStmt | whileStmt | forStmt        ← NIEUW
+    #             | breakStmt | continueStmt            ← NIEUW
+    #             | switchStmt | scopeStmt              ← NIEUW
     #
-    # ANTLR kiest het juiste alternatief — we checken welk kind aanwezig is.
-    #
-    # VOLGORDE VAN CHECKEN IS BELANGRIJK:
-    #   1. arrayDec vóór varDec: beide beginnen met een type, maar arrayDec
-    #      heeft '[' na de naam. ANTLR's lookahead handelt dit af in de grammar,
-    #      maar we checken hier gewoon ctx.arrayDec() first.
-    #   2. functionCall vóór expression: een functionCall IS ook een expression
-    #      in de grammar. We checken ctx.functionCall() eerst zodat we de
-    #      juiste visitor-methode aanroepen.
+    # VOLGORDE: control flow checks komen NA de bestaande checks.
+    # De nieuwe alternatieven beginnen elk met een uniek keyword dus
+    # er is geen ambiguïteit met de bestaande regels.
     def visitStatement(self, ctx):
         if ctx.varDec():
             return self.visit(ctx.varDec())
-
         if ctx.arrayDec():
             return self.visit(ctx.arrayDec())
-
         if ctx.varAss():
             return self.visit(ctx.varAss())
-
-        # NIEUW: function call als statement (de ';' gooien we weg)
         if ctx.functionCall():
             return self.visit(ctx.functionCall())
-
-        # NIEUW: comment als statement
         if ctx.comment():
             return self.visit(ctx.comment())
 
-        # anders: expression SC — bezoek de expressie, gooi ';' weg
+        # NIEUW: control flow
+        if ctx.ifStmt():
+            return self.visit(ctx.ifStmt())
+        if ctx.whileStmt():
+            return self.visit(ctx.whileStmt())
+        if ctx.forStmt():
+            return self.visit(ctx.forStmt())
+        if ctx.breakStmt():
+            return self.visit(ctx.breakStmt())
+        if ctx.continueStmt():
+            return self.visit(ctx.continueStmt())
+        if ctx.switchStmt():
+            return self.visit(ctx.switchStmt())
+        if ctx.scopeStmt():
+            return self.visit(ctx.scopeStmt())
+
+        # fallback: expression SC
         return self.visit(ctx.expression())
 
     # --------------------------------------------------------
-    # visitType, visitBaseType, visitVarDec, visitVarAss
+    # visitIfStmt (NIEUW)
     # --------------------------------------------------------
-    # Ongewijzigd van assignment 2.
+    # Grammar: ifStmt : IF_KW LPAREN expression RPAREN block
+    #                   (ELSE_KW (block | ifStmt))?
+    #
+    # Drie gevallen:
+    #   1. if (cond) { ... }                     → else_block = None
+    #   2. if (cond) { ... } else { ... }        → else_block = BlockNode
+    #   3. if (cond) { ... } else if (...) { }   → else_block = IfNode (recursief)
+    #
+    # ANTLR geeft de else-tak terug via ctx.block() en ctx.ifStmt():
+    #   - ctx.block()  geeft een LIJST: [then_block] of [then_block, else_block]
+    #   - ctx.ifStmt() geeft de geneste if terug als er een 'else if' is
+    #
+    # EDGE CASE: ctx.block() heeft altijd minstens één element (de then-tak).
+    # Een tweede element is aanwezig als de else-tak een block is.
+    def visitIfStmt(self, ctx):
+        condition  = self.visit(ctx.expression())
+        then_block = self.visit(ctx.block(0))   # altijd aanwezig
 
+        else_block = None
+        if ctx.ELSE_KW():
+            if ctx.ifStmt():
+                # else if → recursief IfNode
+                else_block = self.visit(ctx.ifStmt())
+            else:
+                # gewone else → tweede block
+                else_block = self.visit(ctx.block(1))
+
+        return IfNode(condition, then_block, else_block)
+
+    # --------------------------------------------------------
+    # visitWhileStmt (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: whileStmt : WHILE_KW LPAREN expression RPAREN block
+    #
+    # Eenvoudig: conditie + body, geen update.
+    def visitWhileStmt(self, ctx):
+        condition = self.visit(ctx.expression())
+        body      = self.visit(ctx.block())
+        return WhileNode(condition, body, update=None)
+
+    # --------------------------------------------------------
+    # visitForStmt (NIEUW) — vertaling naar WhileNode
+    # --------------------------------------------------------
+    # Grammar: forStmt : FOR_KW LPAREN forInit? SC expression? SC expression? RPAREN block
+    #
+    # Een for-lus wordt in de AST OMGEZET naar een structuur die de LLVM
+    # visitor makkelijk kan verwerken. We geven een LIJST van statements terug
+    # in plaats van één node, zodat de init vóór de while kan staan.
+    #
+    # MAAR: visitStatement verwacht één node terug. Oplossing: we geven een
+    # speciaal ForUnpackNode terug... of we pakken dit anders aan.
+    #
+    # BETERE AANPAK: we geven een BlockNode terug die de init + while bevat.
+    # De caller (visitStatement) zet dit gewoon in de statement lijst.
+    # De omringende visitBlock zal dit zien als één statement (een BlockNode),
+    # wat semantisch correct is — de for-lus heeft zijn eigen scope.
+    #
+    # Structuur van de vertaling:
+    #   for (init; cond; update) { body }
+    #   →  ScopeNode(BlockNode([
+    #          init_stmt,          ← VarDeclNode of AssignNode (of niets)
+    #          WhileNode(
+    #            condition = cond  ← of LiteralNode(1) als leeg
+    #            body      = BlockNode([body..., update_as_stmt])
+    #            update    = update_expr  ← voor continue-correctheid
+    #          )
+    #      ]))
+    #
+    # EDGE CASE: lege init (for(; cond; update)) → geen init_stmt
+    # EDGE CASE: lege conditie (for(init;;)) → condition = LiteralNode(1, 'int')
+    # EDGE CASE: lege update (for(init; cond;)) → geen update in body
+    # EDGE CASE: continue in for-lus → WhileNode.update zodat LLVM visitor
+    #            weet dat update uitgevoerd moet worden vóór de volgende iteratie
+    def visitForStmt(self, ctx):
+        # ── INIT ──────────────────────────────────────────────────────────
+        # forInit? → kan None zijn
+        init_stmt = None
+        if ctx.forInit():
+            init_stmt = self.visit(ctx.forInit())
+
+        # ── CONDITIE ──────────────────────────────────────────────────────
+        # expression? op positie 0 (na de eerste ';')
+        # ctx.expression() geeft een lijst: [cond] of [cond, update] of []
+        expressions = ctx.expression()
+
+        if len(expressions) >= 1:
+            condition = self.visit(expressions[0])
+        else:
+            # lege conditie → altijd waar (oneindige lus)
+            condition = LiteralNode(1, 'int')
+
+        # ── UPDATE ────────────────────────────────────────────────────────
+        # expression? op positie 1 (na de tweede ';')
+        update_expr = None
+        if len(expressions) >= 2:
+            update_expr = self.visit(expressions[1])
+
+        # ── BODY ──────────────────────────────────────────────────────────
+        body_block = self.visit(ctx.block())
+
+        # voeg de update toe als LAATSTE statement in de body
+        # zodat hij bij elke iteratie uitgevoerd wordt
+        # (continue in de LLVM visitor springt naar het update-label)
+        if update_expr is not None:
+            # wrap de update expressie als statement
+            body_block.statements = body_block.statements + [update_expr]
+
+        # bouw de WhileNode — update opslaan voor continue-correctheid
+        while_node = WhileNode(condition, body_block, update=update_expr)
+
+        # wrap alles in een ScopeNode zodat de init-variabele scoped is
+        inner_stmts = []
+        if init_stmt is not None:
+            inner_stmts.append(init_stmt)
+        inner_stmts.append(while_node)
+
+        return ScopeNode(BlockNode(inner_stmts))
+
+    # --------------------------------------------------------
+    # visitForInit (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: forInit : type ID (ASSIGN expression)?   (declaratie)
+    #                  | expression                      (expressie)
+    #
+    # EDGE CASE: onderscheid tussen declaratie en expressie:
+    #   - ctx.type_() aanwezig → declaratie (int i = 0)
+    #   - anders → expressie (i = 0, i++)
+    def visitForInit(self, ctx):
+        if ctx.type_():
+            # declaratie: int i = 0
+            var_type = self.visit(ctx.type_())
+            name     = ctx.ID().getText()
+            value    = self.visit(ctx.expression()) if ctx.expression() else None
+            return VarDeclNode(var_type, name, value)
+        else:
+            # expressie: i = 0 of i++
+            return self.visit(ctx.expression())
+
+    # --------------------------------------------------------
+    # visitBreakStmt / visitContinueStmt (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: breakStmt    : BREAK_KW SC
+    #          continueStmt : CONTINUE_KW SC
+    #
+    # Beide zijn blad-nodes zonder kinderen.
+    def visitBreakStmt(self, ctx):
+        return BreakNode()
+
+    def visitContinueStmt(self, ctx):
+        return ContinueNode()
+
+    # --------------------------------------------------------
+    # visitSwitchStmt (NIEUW) — vertaling naar IfNode keten
+    # --------------------------------------------------------
+    # Grammar: switchStmt : SWITCH_KW LPAREN expression RPAREN
+    #                       LBRACE caseClause* defaultClause? RBRACE
+    #
+    # Een switch wordt omgezet naar een if-else keten:
+    #   switch (x) {
+    #     case 1: stmts1 break;
+    #     case 2: stmts2 break;
+    #     default: stmts3
+    #   }
+    # →
+    #   if (x == 1) { stmts1 }
+    #   else if (x == 2) { stmts2 }
+    #   else { stmts3 }
+    #
+    # EDGE CASE: geen cases → geef een lege ScopeNode terug
+    # EDGE CASE: geen default → de else-tak van de laatste if is None
+    # EDGE CASE: break aan het einde van een case → wordt WEGGEGOOID
+    #   in de vertaling, want de if-else structuur heeft geen fallthrough.
+    #   Een break buiten de case-body (bv. in een geneste while) blijft wel.
+    # EDGE CASE: lege case body → BlockNode([])
+    #
+    # BELANGRIJK: de switch-expressie (x) kan side-effects hebben (bv. x++).
+    # We evalueren hem maar één keer door hem op te slaan in een tijdelijke
+    # variabele. Dit doen we NIET in de AST (te complex) — we vertrouwen
+    # erop dat de expressie geen side-effects heeft in onze subset van C.
+    def visitSwitchStmt(self, ctx):
+        switch_expr = self.visit(ctx.expression())
+
+        # check voor directe varDecl in switch zonder anonieme scope
+        for case_ctx in ctx.caseClause():
+            for stmt_ctx in case_ctx.statement():
+                if stmt_ctx.varDec() or stmt_ctx.arrayDec():
+                    self.errors.append(
+                        "[ Error ] Variabele declaratie direct in switch body "
+                        "zonder anonieme scope. Gebruik { } om een scope te maken."
+                    )
+        if ctx.defaultClause():
+            for stmt_ctx in ctx.defaultClause().statement():
+                if stmt_ctx.varDec() or stmt_ctx.arrayDec():
+                    self.errors.append(
+                        "[ Error ] Variabele declaratie direct in switch body "
+                        "zonder anonieme scope. Gebruik { } om een scope te maken."
+                    )
+
+        # check voor meerdere case-labels op één body
+        case_ctxs = ctx.caseClause()
+        for idx, case_ctx in enumerate(case_ctxs):
+            if len(case_ctx.statement()) == 0 and idx < len(case_ctxs) - 1:
+                self.errors.append(
+                    "[ Error ] Meerdere case-labels op één body zijn niet ondersteund. "
+                    "Elke case moet zijn eigen body hebben."
+                )
+
+        # verzamel alle case-clauses
+        cases = []
+        for case_ctx in ctx.caseClause():
+            cases.append(self.visit(case_ctx))
+
+        # verzamel de default-clause (optioneel)
+        default_stmts = None
+        if ctx.defaultClause():
+            default_stmts = self.visit(ctx.defaultClause())
+
+        # geen cases en geen default → lege scope
+        if not cases and default_stmts is None:
+            return ScopeNode(BlockNode([]))
+
+        # bouw de if-else keten van achter naar voren
+        current_else = None
+        if default_stmts is not None:
+            current_else = BlockNode(default_stmts)
+
+        for case_value_expr, case_stmts in reversed(cases):
+            condition = BinaryOpNode('==', switch_expr, case_value_expr)
+            then_block = BlockNode(case_stmts)
+            current_else = IfNode(condition, then_block, current_else)
+
+        return current_else
+
+    # --------------------------------------------------------
+    # visitCaseClause (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: caseClause : CASE_KW expression COLON statement*
+    #
+    # Geeft een tuple terug: (waarde_expressie, lijst_van_statements)
+    # Break-statements AAN HET EINDE van de case worden weggegoid
+    # (want de if-else vertaling heeft geen fallthrough).
+    #
+    # EDGE CASE: break middenin een case (bv. in een geneste while) blijft wél,
+    # want die break behoort niet tot de switch-case logica maar tot de while.
+    # We verwijderen alleen de LAATSTE statement als het een BreakNode is.
+    def visitCaseClause(self, ctx):
+        value_expr = self.visit(ctx.expression())
+        stmts = []
+        for stmt_ctx in ctx.statement():
+            stmts.append(self.visit(stmt_ctx))
+
+        # break direct als laatste statement
+        if stmts and isinstance(stmts[-1], BreakNode):
+            stmts.pop()
+        # break als laatste statement IN een anonieme scope
+        elif stmts and isinstance(stmts[-1], ScopeNode):
+            scope_stmts = stmts[-1].body.statements
+            if scope_stmts and isinstance(scope_stmts[-1], BreakNode):
+                scope_stmts.pop()
+
+        return (value_expr, stmts)
+
+    # --------------------------------------------------------
+    # visitDefaultClause (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: defaultClause : DEFAULT_KW COLON statement*
+    #
+    # Geeft een lijst van statements terug.
+    def visitDefaultClause(self, ctx):
+        stmts = []
+        for stmt_ctx in ctx.statement():
+            stmts.append(self.visit(stmt_ctx))
+
+        # break direct als laatste statement
+        if stmts and isinstance(stmts[-1], BreakNode):
+            stmts.pop()
+        # break als laatste statement IN een anonieme scope
+        elif stmts and isinstance(stmts[-1], ScopeNode):
+            scope_stmts = stmts[-1].body.statements
+            if scope_stmts and isinstance(scope_stmts[-1], BreakNode):
+                scope_stmts.pop()
+
+        return stmts
+
+    # --------------------------------------------------------
+    # visitScopeStmt (NIEUW)
+    # --------------------------------------------------------
+    # Grammar: scopeStmt : block
+    #
+    # Een anonieme scope is gewoon een block als statement.
+    def visitScopeStmt(self, ctx):
+        body = self.visit(ctx.block())
+        return ScopeNode(body)
+
+    # --------------------------------------------------------
+    # visitType (uitgebreid voor enum types)
+    # --------------------------------------------------------
+    # Grammar: type : CONST_KW? baseType STAR*
+    #               | ENUM_KW ID
+    #
+    # NIEUW: tweede alternatief voor enum types.
+    # ANTLR onderscheidt de twee alternatieven via ctx.ENUM_KW():
+    #   - ctx.ENUM_KW() aanwezig → enum type: TypeNode('EnumNaam', 0, False)
+    #   - anders → bestaand gedrag (baseType + const + pointers)
+    #
+    # EDGE CASE: een enum type heeft geen pointer depth en geen const
+    # in onze subset van C.
     def visitType(self, ctx):
+        if ctx.ENUM_KW():
+            # enum type: ENUM_KW ID → TypeNode met de enum naam als base_type
+            enum_name = ctx.ID().getText()
+            return TypeNode(enum_name, pointer_depth=0, is_const=False)
+
+        # bestaand gedrag (ongewijzigd van assignment 3)
         is_const      = ctx.CONST_KW() is not None
         base_type     = self.visit(ctx.baseType())
         pointer_depth = len(ctx.STAR())
         return TypeNode(base_type, pointer_depth, is_const)
+
+    # --------------------------------------------------------
+    # Hieronder: ONGEWIJZIGD van assignment 3
+    # --------------------------------------------------------
 
     def visitBaseType(self, ctx):
         return ctx.getText()
@@ -162,18 +487,10 @@ class CSTtoASTVisitor(ParseTreeVisitor):
     def visitVarDec(self, ctx):
         var_type = self.visit(ctx.type_())
         name     = ctx.ID().getText()
-
-        # BELANGRIJK: ctx.expression() hier geeft een ENKELVOUDIG object terug
-        # (geen lijst), omdat 'expression' maar EEN keer voorkomt in varDec:
-        #   varDec : type ID (ASSIGN expression)? SC
-        # Dit verschilt van visitFunctionCall waar expression meerdere keren
-        # voorkomt en ctx.expression() een lijst teruggeeft!
-        # Als de grammar ooit verandert → gebruik dan ctx.expression(0).
         if ctx.expression():
             value = self.visit(ctx.expression())
         else:
             value = None
-
         return VarDeclNode(var_type, name, value)
 
     def visitVarAss(self, ctx):
@@ -181,96 +498,31 @@ class CSTtoASTVisitor(ParseTreeVisitor):
         value  = self.visit(ctx.expression(1))
         return AssignNode(target, value)
 
-    # --------------------------------------------------------
-    # visitArrayDec: array declaratie
-    # --------------------------------------------------------
-    # Grammar: arrayDec : type ID (LBRACKET INTEGER RBRACKET)+ (ASSIGN arrayInit)? SC
-    #
-    # Voorbeelden:
-    #   int arr[3];                     → ArrayDeclNode(TypeNode('int'), 'arr', [3], None)
-    #   float grid[2][3] = {{...},{...}}; → ArrayDeclNode(TypeNode('float'), 'grid', [2,3], ...)
-    #
-    # EDGE CASE: ctx.INTEGER() geeft een LIJST van alle INTEGER tokens terug,
-    # één per dimensie. We itereren over de lijst en parsen elk naar int.
-    #
-    # EDGE CASE: er is altijd minstens één INTEGER (de grammar dwingt + af),
-    # maar we behandelen de lijst generiek zodat we altijd correct werken.
     def visitArrayDec(self, ctx):
-        # stap 1: het type van de elementen
-        var_type = self.visit(ctx.type_())
-
-        # stap 2: de naam van de array variabele
-        name = ctx.ID().getText()
-
-        # stap 3: de dimensies — ctx.INTEGER() geeft een lijst van tokens
-        # Voorbeeld: int arr[2][4] → ctx.INTEGER() = [Token('2'), Token('4')]
+        var_type   = self.visit(ctx.type_())
+        name       = ctx.ID().getText()
         dimensions = [int(tok.getText()) for tok in ctx.INTEGER()]
-
-        # stap 4: de optionele initialisator
-        # ctx.arrayInit() geeft None terug als er geen '= {...}' is
+        initializer = None
         if ctx.arrayInit():
             initializer = self.visit(ctx.arrayInit())
-        else:
-            initializer = None
-
         return ArrayDeclNode(var_type, name, dimensions, initializer)
 
-    # --------------------------------------------------------
-    # visitArrayInit: array initialisator { ... }
-    # --------------------------------------------------------
-    # Grammar: arrayInit : LBRACE (arrayElement (COMMA arrayElement)*)? RBRACE
-    #
-    # EDGE CASE: lege initialisator {} → ArrayInitNode([])
-    # De grammar maakt de inhoud optioneel via de ? → we checken ctx.arrayElement()
-    # die een lege lijst teruggeeft als er geen elementen zijn.
     def visitArrayInit(self, ctx):
         elements = []
         for elem_ctx in ctx.arrayElement():
             elements.append(self.visit(elem_ctx))
         return ArrayInitNode(elements)
 
-    # --------------------------------------------------------
-    # visitArrayElement: één element in een initialisator
-    # --------------------------------------------------------
-    # Grammar: arrayElement : expression | arrayInit
-    #
-    # EDGE CASE: we moeten onderscheid maken tussen een expressie en
-    # een geneste initialisator. We checken ctx.arrayInit() eerst.
     def visitArrayElement(self, ctx):
         if ctx.arrayInit():
             return self.visit(ctx.arrayInit())
         return self.visit(ctx.expression())
 
-    # --------------------------------------------------------
-    # visitFunctionCall: printf(...) of scanf(...)
-    # --------------------------------------------------------
-    # Grammar: functionCall : ID LPAREN (expression (COMMA expression)*)? RPAREN
-    #
-    # EDGE CASE: geen argumenten → ctx.expression() geeft lege lijst terug.
-    # De ? in de grammar maakt de hele argumentenlijst optioneel.
-    #
-    # EDGE CASE: ctx.expression() geeft hier een LIJST terug omdat expression
-    # meerdere keren voorkomt in de regel. Dat is anders dan in varDec waar
-    # expression maar één keer voorkomt!
     def visitFunctionCall(self, ctx):
         name = ctx.ID().getText()
-
-        # ctx.expression() geeft een lijst van alle argumenten (kan leeg zijn)
-        args = []
-        for expr_ctx in ctx.expression():
-            args.append(self.visit(expr_ctx))
-
+        args = [self.visit(e) for e in ctx.expression()]
         return FunctionCallNode(name, args)
 
-    # --------------------------------------------------------
-    # visitComment: // of /* */
-    # --------------------------------------------------------
-    # Grammar: comment : LINE_COMMENT_TOKEN | BLOCK_COMMENT_TOKEN
-    #
-    # We slaan de volledige token tekst op, inclusief de // of /* */ delimiters.
-    #
-    # EDGE CASE: ctx.LINE_COMMENT_TOKEN() of ctx.BLOCK_COMMENT_TOKEN() kan
-    # None zijn als het het andere type is. We checken welke aanwezig is.
     def visitComment(self, ctx):
         if ctx.LINE_COMMENT_TOKEN():
             text = ctx.LINE_COMMENT_TOKEN().getText()
@@ -278,34 +530,18 @@ class CSTtoASTVisitor(ParseTreeVisitor):
             text = ctx.BLOCK_COMMENT_TOKEN().getText()
         return CommentNode(text)
 
-    # --------------------------------------------------------
-    # visitExpression: het hart van de visitor (uitgebreid)
-    # --------------------------------------------------------
-    # Nieuw in assignment 3:
-    #   ① STRING literal        → StringLiteralNode
-    #   ② functionCall als expr → FunctionCallNode (via visitFunctionCall)
-    #   ③ array toegang         → ArrayAccessNode
-    #      expr[expr] heeft 4 kinderen: expr, '[', expr, ']'
-    #      LET OP: cast LPAREN type RPAREN expr heeft ook 4 kinderen!
-    #      We onderscheiden ze door kind 1 te inspecteren:
-    #        kind 1 == '[' → array toegang
-    #        kind 0 == '(' → cast
     def visitExpression(self, ctx):
         child_count = ctx.getChildCount()
 
-        # ── GEVAL 1: INTEGER literal ────────────────────────────────────────
         if ctx.INTEGER():
             return LiteralNode(int(ctx.INTEGER().getText()), 'int')
 
-        # ── GEVAL 2: FLOAT literal ──────────────────────────────────────────
         if ctx.FLOAT():
             return LiteralNode(float(ctx.FLOAT().getText()), 'float')
 
-        # ── GEVAL 3: CHAR literal ───────────────────────────────────────────
         if ctx.CHAR():
-            tekst = ctx.CHAR().getText()   # bv. "'a'" of "'\\n'"
-            inner = tekst[1:-1]            # verwijder de omringende quotes
-
+            tekst = ctx.CHAR().getText()
+            inner = tekst[1:-1]
             if inner.startswith('\\'):
                 escape_map = {
                     'n': '\n', 't': '\t', 'r': '\r',
@@ -314,94 +550,55 @@ class CSTtoASTVisitor(ParseTreeVisitor):
                 waarde = escape_map.get(inner[1], inner[1])
             else:
                 waarde = inner
-
             return LiteralNode(waarde, 'char')
 
-        # ── GEVAL 4: STRING literal (NIEUW) ─────────────────────────────────
-        # Voorbeeld: "hello\n" → StringLiteralNode("hello\n")
-        #
-        # EDGE CASE: ctx.STRING().getText() geeft de tekst MET aanhalingstekens
-        # terug, bv. '"hello\\n"'. We slaan de tekst ZONDER aanhalingstekens op.
-        # We doen GEEN escape processing hier — dat is de taak van de LLVM visitor.
-        #
-        # EDGE CASE: lege string "" → getText() = '""' → value = ''
         if ctx.STRING():
-            raw = ctx.STRING().getText()    # '"hello\\n"'
-            value = raw[1:-1]               # 'hello\\n' (zonder quotes)
+            raw   = ctx.STRING().getText()
+            value = raw[1:-1]
             return StringLiteralNode(value)
 
-        # ── GEVAL 5: variabele (identifier) ────────────────────────────────
         if ctx.ID():
             return VariableNode(ctx.ID().getText())
 
-        # ── GEVAL 6: functionCall als expressie (NIEUW) ─────────────────────
-        # Voorbeeld: int n = printf("hello");
-        # ANTLR plaatst een functionCall sub-context als kind.
-        # We delegeren naar visitFunctionCall.
-        #
-        # BELANGRIJK: dit moet VOOR de child_count logica komen, want
-        # een functionCall heeft variabel aantal kinderen en wordt anders
-        # verward met een binaire operatie.
         if ctx.functionCall():
             return self.visit(ctx.functionCall())
 
-        # ── GEVAL 7: cast → (type) expression ──────────────────────────────
-        # Structuur: LPAREN type RPAREN expression → 4 kinderen
-        # We herkennen dit doordat er een type()-kind is.
-        # MOET voor de child_count == 4 check komen!
+        # cast: LPAREN type RPAREN expression → type() aanwezig
         if ctx.type_():
             target_type = self.visit(ctx.type_())
             operand     = self.visit(ctx.expression(0))
             return CastNode(target_type, operand)
 
-        # ── GEVAL 8: haakjes → ( expression ) ──────────────────────────────
-        # 3 kinderen: '(', expression, ')'
+        # suffix ++ of --: expression PLUSPLUS / MINUSMINUS (2 kinderen)
+        if child_count == 2:
+            child1 = ctx.getChild(1).getText()
+            if child1 == '++':
+                return UnaryOpNode('suffix++', self.visit(ctx.expression(0)))
+            if child1 == '--':
+                return UnaryOpNode('suffix--', self.visit(ctx.expression(0)))
+
+        # unaire operatoren (prefix): -, +, !, ~, &, *, ++, --
+        if child_count == 2:
+            op_text = ctx.getChild(0).getText()
+            operand = self.visit(ctx.expression(0))
+            return UnaryOpNode(op_text, operand)
+
+        # haakjes: ( expression ) → 3 kinderen: '(' expr ')'
         if child_count == 3 and ctx.getChild(0).getText() == '(':
             return self.visit(ctx.expression(0))
 
-        # ── GEVAL 9: array toegang → expression[expression] (NIEUW) ────────
-        # Structuur: expression LBRACKET expression RBRACKET → 4 kinderen
-        # We herkennen dit doordat kind[1].getText() == '['.
-        #
-        # EDGE CASE: arr[i][j] wordt door ANTLR als links-associatief geparseerd:
-        #   ((arr[i])[j])
-        # De recursieve expressie aan de linkerkant is al een ArrayAccessNode,
-        # en dit wordt gewoon de array_expr van de buitenste ArrayAccessNode.
-        # We hoeven hier niets speciaals te doen — het werkt automatisch!
+        # array toegang: expression '[' expression ']' → 4 kinderen
         if child_count == 4 and ctx.getChild(1).getText() == '[':
-            array_expr = self.visit(ctx.expression(0))  # de array
-            index      = self.visit(ctx.expression(1))  # de index
+            array_expr = self.visit(ctx.expression(0))
+            index      = self.visit(ctx.expression(1))
             return ArrayAccessNode(array_expr, index)
 
-        # ── GEVAL 10: unaire operatoren (2 kinderen) ────────────────────────
-        # Suffix: expression OP  (kind 0 is expr, kind 1 is operator)
-        # Prefix: OP expression  (kind 0 is operator, kind 1 is expr)
-        if child_count == 2:
-            first = ctx.getChild(0).getText()
-            last  = ctx.getChild(1).getText()
-
-            if last == '++':
-                return UnaryOpNode('suffix++', self.visit(ctx.expression(0)))
-            if last == '--':
-                return UnaryOpNode('suffix--', self.visit(ctx.expression(0)))
-            if first == '++':
-                return UnaryOpNode('prefix++', self.visit(ctx.expression(0)))
-            if first == '--':
-                return UnaryOpNode('prefix--', self.visit(ctx.expression(0)))
-
-            # alle andere unaire prefix operatoren: -, +, !, ~, &, *
-            return UnaryOpNode(first, self.visit(ctx.expression(0)))
-
-        # ── GEVAL 11: binaire operatie (3 kinderen) ─────────────────────────
-        # Structuur: expression OPERATOR expression
+        # binaire operatie: expression op expression → 3 kinderen
         if child_count == 3:
-            left     = self.visit(ctx.expression(0))
-            operator = ctx.getChild(1).getText()
-            right    = self.visit(ctx.expression(1))
-            return BinaryOpNode(operator, left, right)
+            left  = self.visit(ctx.expression(0))
+            op    = ctx.getChild(1).getText()
+            right = self.visit(ctx.expression(1))
+            return BinaryOpNode(op, left, right)
 
-        # ── GEVAL 12: onverwacht ─────────────────────────────────────────────
-        raise ValueError(
-            f"Onverwacht patroon in expression: {ctx.getText()!r} "
-            f"(aantal kinderen: {child_count})"
-        )
+        # fallback (zou niet mogen voorkomen na semantic analysis)
+        return LiteralNode(0, 'int')

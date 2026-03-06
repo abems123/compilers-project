@@ -1,7 +1,7 @@
 # src/parser/ast_nodes.py
 #
 # Bevat alle AST node klassen voor de compiler.
-# Assignment 3 voegt toe:
+# Assignment 3 voegde toe:
 #   - CommentNode        (comments bewaren in AST)
 #   - ArrayDeclNode      (array declaraties)
 #   - ArrayAccessNode    (array toegang: arr[i], arr[i][j])
@@ -10,7 +10,15 @@
 #   - FunctionCallNode   (printf, scanf, enz.)
 #   - IncludeNode        (#include <stdio.h>)
 #
-# ProgramNode is uitgebreid met een 'includes' lijst.
+# Assignment 4 voegt toe:
+#   - EnumDefNode        (enum definitie: enum Status { READY, BUSY };)
+#   - IfNode             (if / if-else / else-if)
+#   - WhileNode          (while-lus, ook gebruikt voor vertaalde for-lussen)
+#   - BreakNode          (break statement)
+#   - ContinueNode       (continue statement)
+#   - ScopeNode          (anonieme scope { ... })
+#
+# ProgramNode is uitgebreid met een 'enums' lijst (naast de bestaande 'includes').
 
 
 # ============================================================
@@ -27,43 +35,42 @@ class ASTNode:
 
 
 # ============================================================
-# STRUCTUUR NODES (ongewijzigd + uitbreiding ProgramNode)
+# STRUCTUUR NODES
 # ============================================================
 
 class ProgramNode(ASTNode):
     """
     De root van de hele AST. Stelt het volledige C bestand voor.
 
-    Assignment 3 uitbreiding: includes bijhouden zodat de semantic
-    analysis kan checken of stdio.h aanwezig is voor printf/scanf.
+    Assignment 3 uitbreiding: 'includes' lijst voor stdio.h check.
+    Assignment 4 uitbreiding: 'enums' lijst voor globale enum definities.
 
-    Voorbeeld voor:
-        #include <stdio.h>
-        int main() { ... }
+    WAAROM enums apart bijhouden?
+      De semantic analysis moet enum labels kennen VOORDAT ze de body
+      van main() bezoekt. Als we enums apart opslaan in ProgramNode,
+      kan de semantic analysis ze in één eerste pass verwerken en
+      daarna pas de body analyseren.
 
-    → ProgramNode(
-          includes=[IncludeNode('stdio.h')],
-          body=BlockNode([...])
-      )
+    EDGE CASE: de volgorde van enums in de lijst komt overeen met de
+    volgorde in de broncode. Dit is belangrijk als een enum label
+    gebruikt wordt in een volgende enum definitie (niet ondersteund
+    in onze subset, maar de volgorde klopt wel).
 
-    EDGE CASE: includes is een lijst (niet één waarde) zodat we
-    meerdere includes aankunnen. In practice verwachten we er maximaal
-    één, maar de grammar staat er meerdere toe.
+    EDGE CASE: backwards-compatibiliteit — bestaande code die
+    ProgramNode(body) of ProgramNode(body, includes) aanroept
+    blijft werken dankzij de default waarden.
     """
-    def __init__(self, body: 'BlockNode', includes: list = None):
-        # de body is de BlockNode van de main functie
-        self.body = body
-
-        # lijst van IncludeNode objecten — leeg als er geen includes zijn
-        # We gebruiken None als default en zetten het om naar [] zodat
-        # bestaande code die ProgramNode(body) aanroept nog werkt.
+    def __init__(self, body: 'BlockNode', includes: list = None, enums: list = None):
+        self.body     = body
         self.includes = includes if includes is not None else []
+        # lijst van EnumDefNode objecten — leeg als er geen enums zijn
+        self.enums    = enums    if enums    is not None else []
 
     def accept(self, visitor):
         return visitor.visitProgram(self)
 
     def __repr__(self):
-        return f"ProgramNode(includes={self.includes}, {self.body})"
+        return f"ProgramNode(includes={self.includes}, enums={self.enums}, {self.body})"
 
 
 class BlockNode(ASTNode):
@@ -88,11 +95,13 @@ class BlockNode(ASTNode):
 
 class TypeNode(ASTNode):
     """
-    Beschrijft een type zoals: int, const float*, char**.
-    Ongewijzigd van assignment 2.
+    Beschrijft een type zoals: int, const float*, char**, enum Status.
+    Ongewijzigd van assignment 2 — de 'enum Status' case wordt
+    gerepresenteerd als TypeNode('Status', 0, False) met base_type = 'Status'.
+    De semantic analysis herkent enum types via de symbol table.
     """
     def __init__(self, base_type: str, pointer_depth: int = 0, is_const: bool = False):
-        self.base_type     = base_type      # 'int', 'float', 'char'
+        self.base_type     = base_type      # 'int', 'float', 'char', of enum naam
         self.pointer_depth = pointer_depth  # 0 = geen pointer, 1 = *, 2 = **
         self.is_const      = is_const
 
@@ -106,7 +115,7 @@ class TypeNode(ASTNode):
 
 
 # ============================================================
-# DECLARATIE EN ASSIGNMENT NODES
+# DECLARATIE EN ASSIGNMENT NODES (ongewijzigd)
 # ============================================================
 
 class VarDeclNode(ASTNode):
@@ -115,6 +124,7 @@ class VarDeclNode(ASTNode):
     Ongewijzigd van assignment 2.
 
     Voorbeeld: int x = 5;  →  VarDeclNode(TypeNode('int'), 'x', LiteralNode(5))
+    Voorbeeld: enum Status s = BUSY; → VarDeclNode(TypeNode('Status'), 's', VariableNode('BUSY'))
     """
     def __init__(self, var_type: TypeNode, name: str, value: ASTNode = None):
         self.var_type = var_type
@@ -146,7 +156,7 @@ class AssignNode(ASTNode):
 
 
 # ============================================================
-# ARRAY NODES (NIEUW in assignment 3)
+# ARRAY NODES (ongewijzigd van assignment 3)
 # ============================================================
 
 class ArrayDeclNode(ASTNode):
@@ -163,22 +173,15 @@ class ArrayDeclNode(ASTNode):
       int matrix[2][4];
         → ArrayDeclNode(TypeNode('int'), 'matrix', [2, 4], None)
 
-      float grid[2][3] = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}};
-        → ArrayDeclNode(TypeNode('float'), 'grid', [2, 3],
-              ArrayInitNode([ArrayInitNode([...]), ArrayInitNode([...])]))
-
     EDGE CASE: dimensions is altijd een lijst van ints (geen expressies).
-    De grammar dwingt dit af door alleen INTEGER tokens toe te staan als dimensie.
-
     EDGE CASE: var_type bevat het basistype van de ELEMENTEN, niet van het array zelf.
-    Een 'int arr[3]' heeft var_type = TypeNode('int'), niet TypeNode('int[]').
     """
     def __init__(self, var_type: TypeNode, name: str,
                  dimensions: list, initializer: 'ArrayInitNode' = None):
-        self.var_type    = var_type      # type van de elementen: int, float, char
-        self.name        = name          # naam van de array variabele
-        self.dimensions  = dimensions    # lijst van ints: [3] of [2, 4] enz.
-        self.initializer = initializer   # ArrayInitNode of None
+        self.var_type    = var_type
+        self.name        = name
+        self.dimensions  = dimensions
+        self.initializer = initializer
 
     def accept(self, visitor):
         return visitor.visitArrayDecl(self)
@@ -196,20 +199,9 @@ class ArrayInitNode(ASTNode):
       - een gewone expressie (voor 1D arrays):    {1, x+2, -9}
       - een geneste ArrayInitNode (voor 2D+):     {{1,2}, {3,4}}
 
-    EDGE CASE: lege initialisator {} is toegestaan door de grammar.
-    De semantic analysis zal controleren of de lengte klopt met de dimensie.
-
-    EDGE CASE: geneste diepte kan variëren — een 3D array heeft drie niveaus
-    van ArrayInitNode nesting. Dit werkt automatisch doordat elementen
-    ASTNode zijn en dus ook ArrayInitNode kunnen zijn.
-
-    Voorbeelden:
-      {1, 2, 3}         → ArrayInitNode([LiteralNode(1), LiteralNode(2), LiteralNode(3)])
-      {{1,2}, {3,4}}    → ArrayInitNode([ArrayInitNode([...]), ArrayInitNode([...])])
-      {}                → ArrayInitNode([])
+    EDGE CASE: lege initialisator {} → elements = []
     """
     def __init__(self, elements: list):
-        # lijst van ASTNode — elk element is een expressie of een ArrayInitNode
         self.elements = elements
 
     def accept(self, visitor):
@@ -221,38 +213,16 @@ class ArrayInitNode(ASTNode):
 
 class ArrayAccessNode(ASTNode):
     """
-    Array toegang: het indexeren van een array element.
+    Array toegang: arr[i], arr[i][j].
 
-    Voorbeelden:
-      arr[i]      → ArrayAccessNode(VariableNode('arr'), VariableNode('i'))
-      arr[2]      → ArrayAccessNode(VariableNode('arr'), LiteralNode(2))
-      matrix[i][j]
-        → ArrayAccessNode(
-              ArrayAccessNode(VariableNode('matrix'), VariableNode('i')),
-              VariableNode('j')
-          )
+    Voor multi-dimensionale toegang nestelen we ArrayAccessNodes:
+      arr[i][j] → ArrayAccessNode(ArrayAccessNode(VariableNode('arr'), i), j)
 
-    EDGE CASE: voor multi-dimensionale toegang (arr[i][j]) nestelen we
-    ArrayAccessNodes. De CST visitor bouwt dit automatisch doordat
-    'expression[expression]' links-recursief is in de grammar.
-    arr[i][j] wordt geparseerd als (arr[i])[j]:
-      - eerste stap: ArrayAccessNode(VariableNode('arr'), i)
-      - tweede stap: ArrayAccessNode(dat resultaat, j)
-
-    EDGE CASE: de index kan een willekeurige expressie zijn, niet alleen
-    een variabele of literal. De semantic analysis controleert dat het
-    type van de index een int is.
-
-    DESIGN KEUZE: we slaan de array_expr op als ASTNode (niet als string),
-    zodat we ook expressies als base kunnen hebben, bijvoorbeeld:
-      getArray()[0]  (als we ooit functies met return waarden ondersteunen)
+    EDGE CASE: de index kan een willekeurige expressie zijn.
     """
     def __init__(self, array_expr: ASTNode, index: ASTNode):
-        # het ding dat geïndexeerd wordt: VariableNode of ArrayAccessNode (voor nesting)
         self.array_expr = array_expr
-
-        # de index expressie: moet van type int zijn (check in semantic analysis)
-        self.index = index
+        self.index      = index
 
     def accept(self, visitor):
         return visitor.visitArrayAccess(self)
@@ -262,7 +232,7 @@ class ArrayAccessNode(ASTNode):
 
 
 # ============================================================
-# EXPRESSIE NODES
+# EXPRESSIE NODES (ongewijzigd van assignment 3)
 # ============================================================
 
 class LiteralNode(ASTNode):
@@ -271,7 +241,7 @@ class LiteralNode(ASTNode):
     Ongewijzigd van assignment 2.
     """
     def __init__(self, value, type_name: str):
-        self.value     = value      # de Python waarde: int, float, of str
+        self.value     = value
         self.type_name = type_name  # 'int', 'float', of 'char'
 
     def accept(self, visitor):
@@ -284,28 +254,10 @@ class LiteralNode(ASTNode):
 class StringLiteralNode(ASTNode):
     """
     Een string literal: "hello", "Number: %d\n", enz.
-
-    EDGE CASE: we slaan de RAW waarde op — de tekst TUSSEN de aanhalingstekens,
-    maar ZONDER de aanhalingstekens zelf. Dus "hello\n" wordt opgeslagen als
-    de string hello\n (met een echte backslash-n, nog niet verwerkt).
-
-    Waarom niet direct verwerken?
-    Omdat de LLVM codegen de escape sequences zelf moet omzetten naar
-    LLVM's eigen formaat. Bijvoorbeeld: \n wordt \0A in LLVM strings.
-    Als we hier al verwerken, verliezen we de originele representatie.
-
-    EDGE CASE: lege string "" → StringLiteralNode("")
-
-    EDGE CASE: string met %% → wordt door printf verwerkt als literal %,
-    maar wij hoeven dat niet zelf te doen. We geven de raw string door.
-
-    Voorbeeld:
-      "hello\n"  → StringLiteralNode("hello\\n")
-      ""         → StringLiteralNode("")
-      "%d items" → StringLiteralNode("%d items")
+    We slaan de RAW waarde op (tussen de aanhalingstekens, zonder de quotes).
+    Ongewijzigd van assignment 3.
     """
     def __init__(self, value: str):
-        # de tekst van de string, zonder aanhalingstekens, met escape sequences intact
         self.value = value
 
     def accept(self, visitor):
@@ -319,6 +271,10 @@ class VariableNode(ASTNode):
     """
     Een identifier in een expressie.
     Ongewijzigd van assignment 2.
+
+    NIEUW in assignment 4: wordt ook gebruikt voor enum labels (READY, BUSY, enz.)
+    De semantic analysis onderscheidt gewone variabelen van enum labels via de
+    symbol table.
     """
     def __init__(self, name: str):
         self.name = name
@@ -380,43 +336,17 @@ class CastNode(ASTNode):
 
 
 # ============================================================
-# FUNCTIE AANROEP (NIEUW in assignment 3)
+# I/O EN STRUCTUUR NODES (ongewijzigd van assignment 3)
 # ============================================================
 
 class FunctionCallNode(ASTNode):
     """
     Een functie aanroep zoals printf of scanf.
-
-    Voorbeelden:
-      printf("hello\n")
-        → FunctionCallNode('printf', [StringLiteralNode("hello\\n")])
-
-      printf("x = %d\n", x)
-        → FunctionCallNode('printf', [StringLiteralNode("x = %d\\n"),
-                                      VariableNode('x')])
-
-      scanf("%d", &x)
-        → FunctionCallNode('scanf', [StringLiteralNode("%d"),
-                                     UnaryOpNode('&', VariableNode('x'))])
-
-      printf("hello")   (geen extra args)
-        → FunctionCallNode('printf', [StringLiteralNode("hello")])
-
-    EDGE CASE: args kan leeg zijn. De grammar staat dit toe via de optionele
-    argumentenlijst. Een aanroep als printf() zonder argumenten is syntactisch
-    geldig (de semantic analysis zal later klagen als het nodig is).
-
-    EDGE CASE: de naam is gewoon een string. We maken hier geen onderscheid
-    tussen 'printf', 'scanf', of een andere functienaam. De semantic analysis
-    checkt of de naam geldig is en of stdio.h geïncludeerd is.
-
-    DESIGN KEUZE: name is een str (niet een VariableNode), omdat een
-    functienaam geen variabele is — je kan geen functiepointer via een
-    variabele aanroepen in onze subset van C.
+    Ongewijzigd van assignment 3.
     """
     def __init__(self, name: str, args: list):
-        self.name = name    # naam van de functie: 'printf', 'scanf', enz.
-        self.args = args    # lijst van ASTNode argumenten (kan leeg zijn)
+        self.name = name
+        self.args = args
 
     def accept(self, visitor):
         return visitor.visitFunctionCall(self)
@@ -425,74 +355,28 @@ class FunctionCallNode(ASTNode):
         return f"FunctionCallNode({self.name!r}, {self.args})"
 
 
-# ============================================================
-# COMMENT NODE (NIEUW in assignment 3)
-# ============================================================
-
 class CommentNode(ASTNode):
     """
     Een comment die bewaard wordt in de AST.
-
-    In assignment 3 worden comments NIET meer geskipped, maar opgeslagen
-    zodat ze later in de LLVM output kunnen verschijnen als ';' commentaar.
-
-    Voorbeelden:
-      // dit is een comment
-        → CommentNode("// dit is een comment")
-
-      /* dit is een
-         multi-line comment */
-        → CommentNode("/* dit is een\n   multi-line comment */")
-
-    EDGE CASE: we slaan de VOLLEDIGE token tekst op, inclusief de
-    // of /* */ delimiters. Dit maakt het makkelijk om later in de
-    LLVM output te zetten: vervang gewoon '//' door ';' en verwijder '/*' en '*/'.
-
-    EDGE CASE: een lege comment // geeft CommentNode("//").
-    Een lege block comment /**/ geeft CommentNode("/**/").
-
-    EDGE CASE: de LLVM output mag alleen ';' comments op één regel hebben.
-    De LLVM visitor moet multi-line block comments dus splitsen op newlines
-    en elke regel prefixen met ';'.
+    Ongewijzigd van assignment 3.
     """
     def __init__(self, text: str):
-        # de volledige commenttekst inclusief // of /* */ delimiters
         self.text = text
 
     def accept(self, visitor):
         return visitor.visitComment(self)
 
     def __repr__(self):
-        # trim voor leesbaarheid in debug output
         preview = self.text[:40].replace('\n', '\\n')
         return f"CommentNode({preview!r})"
 
 
-# ============================================================
-# INCLUDE NODE (NIEUW in assignment 3)
-# ============================================================
-
 class IncludeNode(ASTNode):
     """
-    Een #include statement bovenaan het programma.
-
-    Momenteel ondersteunen we alleen #include <stdio.h>.
-    De semantic analysis gebruikt de aanwezigheid van IncludeNode('stdio.h')
-    om te bepalen of printf en scanf gebruikt mogen worden.
-
-    EDGE CASE: meerdere includes zijn syntactisch toegestaan door de grammar
-    (includeStmt*). De semantic analysis hoeft alleen te checken of
-    'stdio.h' ergens in de includes lijst staat.
-
-    EDGE CASE: we slaan alleen de headernaam op ('stdio.h'), niet de
-    volledige include-tekst. Zo kunnen we makkelijk vergelijken in
-    de semantic analysis: if any(inc.header == 'stdio.h' for inc in includes).
-
-    Voorbeeld:
-      #include <stdio.h>  →  IncludeNode('stdio.h')
+    Een #include statement.
+    Ongewijzigd van assignment 3.
     """
     def __init__(self, header: str):
-        # de naam van de header, zonder < > of aanhalingstekens
         self.header = header  # 'stdio.h'
 
     def accept(self, visitor):
@@ -500,3 +384,193 @@ class IncludeNode(ASTNode):
 
     def __repr__(self):
         return f"IncludeNode({self.header!r})"
+
+
+# ============================================================
+# ASSIGNMENT 4 — ENUM NODE
+# ============================================================
+
+class EnumDefNode(ASTNode):
+    """
+    Een enum definitie buiten main().
+
+    Voorbeeld:
+      enum SYS_IO_ReceiverStatusBit { READY, BUSY, OFFLINE };
+      → EnumDefNode('SYS_IO_ReceiverStatusBit', ['READY', 'BUSY', 'OFFLINE'])
+
+    DESIGN KEUZE: labels zijn een lijst van strings. De waarden zijn
+    impliciet 0, 1, 2, ... (geen custom waarden per opdracht).
+
+    EDGE CASE: labels worden door de semantic analysis als 'const int'
+    variabelen in de GLOBALE scope geregistreerd met waarden 0, 1, 2, ...
+    Zo werkt READY + 1 gewoon als een integer expressie.
+
+    EDGE CASE: een enum label mag niet dezelfde naam hebben als een
+    bestaande variabele in dezelfde scope. Semantic analysis checkt dit.
+
+    EDGE CASE: enum labels zijn GLOBAAL zichtbaar — ook binnen geneste
+    scopes, zonder scope qualifier (C-stijl unscoped enums).
+    """
+    def __init__(self, name: str, labels: list):
+        self.name   = name    # 'SYS_IO_ReceiverStatusBit'
+        self.labels = labels  # ['READY', 'BUSY', 'OFFLINE']
+
+    def accept(self, visitor):
+        return visitor.visitEnumDef(self)
+
+    def __repr__(self):
+        return f"EnumDefNode({self.name!r}, {self.labels})"
+
+
+# ============================================================
+# ASSIGNMENT 4 — CONTROL FLOW NODES
+# ============================================================
+
+class IfNode(ASTNode):
+    """
+    Een if-statement, met optionele else-tak.
+
+    Voorbeelden:
+      if (x > 0) { ... }
+        → IfNode(condition, then_block, else_block=None)
+
+      if (x > 0) { ... } else { ... }
+        → IfNode(condition, then_block, else_block=BlockNode([...]))
+
+      if (x > 0) { ... } else if (x == 0) { ... } else { ... }
+        → IfNode(condition, then_block,
+              else_block=IfNode(condition2, then_block2,
+                  else_block=BlockNode([...])))
+
+    EDGE CASE: else_block kan None, BlockNode of IfNode zijn.
+    EDGE CASE: lege then- of else-body: BlockNode([]) is geldig.
+    EDGE CASE: geen dangling-else probleem door verplichte curly braces
+               in de grammar.
+    """
+    def __init__(self, condition: ASTNode, then_block: BlockNode,
+                 else_block: ASTNode = None):
+        self.condition  = condition   # de test-expressie
+        self.then_block = then_block  # de if-tak (BlockNode)
+        self.else_block = else_block  # de else-tak (BlockNode, IfNode, of None)
+
+    def accept(self, visitor):
+        return visitor.visitIf(self)
+
+    def __repr__(self):
+        return (f"IfNode(cond={self.condition}, "
+                f"then={self.then_block}, else={self.else_block})")
+
+
+class WhileNode(ASTNode):
+    """
+    Een while-lus. Wordt ook gebruikt voor de for → while vertaling.
+
+    Voorbeeld (while):
+      while (x < 10) { x = x + 1; }
+        → WhileNode(condition=BinaryOpNode('<', ...), body=BlockNode([...]))
+
+    Voorbeeld (for → while vertaling):
+      for (int i = 0; i < 10; i++) { ... }
+      Wordt in de CST→AST visitor omgezet naar:
+        VarDeclNode('i', 0)          ← init statement vóór de WhileNode
+        WhileNode(
+          condition = BinaryOpNode('<', VariableNode('i'), LiteralNode(10)),
+          body      = BlockNode([..., AssignNode(i, i+1)]),  ← update in body
+          update    = BinaryOpNode('+', VariableNode('i'), LiteralNode(1))
+        )
+
+    WAAROM 'update' apart opslaan?
+      Bij een 'continue' in een for-lus moet de update-stap (i++) nog
+      uitgevoerd worden vóór de volgende iteratie. De LLVM visitor kijkt
+      naar WhileNode.update om te weten waar 'continue' naartoe springt:
+        - update is None → continue springt direct naar de conditie (normale while)
+        - update is niet None → continue springt naar het update-label (for-lus)
+
+    EDGE CASE: lege conditie in for (for(;;)) → condition = LiteralNode(1, 'int')
+    EDGE CASE: lege body: WhileNode(cond, BlockNode([])) is geldig.
+    """
+    def __init__(self, condition: ASTNode, body: BlockNode,
+                 update: ASTNode = None):
+        self.condition = condition   # de test-expressie
+        self.body      = body        # het herhaalde blok
+        self.update    = update      # optioneel: for-lus update expressie (i++)
+
+    def accept(self, visitor):
+        return visitor.visitWhile(self)
+
+    def __repr__(self):
+        return (f"WhileNode(cond={self.condition}, "
+                f"body={self.body}, update={self.update})")
+
+
+class BreakNode(ASTNode):
+    """
+    Een break statement.
+
+    Springt uit de dichtstbijzijnde lus of switch.
+
+    EDGE CASE: break buiten een lus/switch → semantic error.
+               De semantic analysis checkt dit via een 'loop_depth' teller.
+    EDGE CASE: break in een switch die in een lus zit → springt alleen
+               uit de switch, niet uit de lus. De LLVM visitor regelt dit
+               via een stack van exit-labels.
+    """
+    def accept(self, visitor):
+        return visitor.visitBreak(self)
+
+    def __repr__(self):
+        return "BreakNode()"
+
+
+class ContinueNode(ASTNode):
+    """
+    Een continue statement.
+
+    Springt naar de volgende iteratie van de dichtstbijzijnde lus.
+
+    EDGE CASE: continue buiten een lus → semantic error.
+    EDGE CASE: continue in een for-lus (vertaald naar while) →
+               springt naar het update-label, niet direct naar de conditie.
+               De LLVM visitor herkent dit via WhileNode.update.
+    """
+    def accept(self, visitor):
+        return visitor.visitContinue(self)
+
+    def __repr__(self):
+        return "ContinueNode()"
+
+
+# ============================================================
+# ASSIGNMENT 4 — SCOPE NODE
+# ============================================================
+
+class ScopeNode(ASTNode):
+    """
+    Een anonieme scope: een blok tussen accolades dat als statement optreedt.
+
+    Voorbeeld:
+      { int x = 5; printf("%d", x); }
+        → ScopeNode(body=BlockNode([VarDeclNode(...), FunctionCallNode(...)]))
+
+    WAAROM ScopeNode en niet gewoon BlockNode als statement?
+      BlockNode wordt al gebruikt als de body van if/while/for.
+      ScopeNode maakt het expliciet dat dit een ANONIEME scope is als
+      zelfstandig statement. Hierdoor kan de DOT visualisatie en de
+      semantic analysis het onderscheid maken.
+
+    EDGE CASE: anonieme scope in een switch body maakt variabele declaratie
+               in switch WEL mogelijk:
+                 switch(x) { case 1: { int y = 0; } break; }
+    EDGE CASE: geneste anonieme scopes: { { int x = 1; } int x = 2; }
+               De binnenste x is alleen zichtbaar in de binnenste scope.
+               Dit werkt automatisch via push_scope()/pop_scope() in de
+               semantic analysis en LLVM visitor.
+    """
+    def __init__(self, body: BlockNode):
+        self.body = body
+
+    def accept(self, visitor):
+        return visitor.visitScope(self)
+
+    def __repr__(self):
+        return f"ScopeNode({self.body})"

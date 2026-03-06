@@ -50,7 +50,15 @@ def main():
     # --------------------------------------------------------
     # Stap 3: CST → AST
     # --------------------------------------------------------
-    ast = CSTtoASTVisitor().visit(cst)
+    ast_visitor = CSTtoASTVisitor()
+    ast = ast_visitor.visit(cst)
+
+    # check voor fouten gevonden tijdens CST→AST vertaling
+    # (bv. variabele declaratie direct in switch zonder anonieme scope)
+    if ast_visitor.errors:
+        for e in ast_visitor.errors:
+            print(e)
+        return
 
     # --------------------------------------------------------
     # Stap 4: semantische analyse
