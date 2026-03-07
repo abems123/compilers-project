@@ -450,7 +450,7 @@ class SemanticAnalysisVisitor:
         # Check: alle paden hebben een return?
         # Alleen voor non-void functies. void functies mogen zonder return eindigen.
         ret_base = entry.return_type[0]
-        if ret_base != 'void' and not self._all_paths_return(node.body):
+        if ret_base != 'void' and node.name != 'main' and not self._all_paths_return(node.body):
             self.warning(
                 f"Functie '{node.name}' heeft return type '{ret_base}' maar "
                 f"niet alle uitvoeringspaden eindigen met een return statement."
@@ -856,12 +856,19 @@ class SemanticAnalysisVisitor:
             return
 
         if target_depth != value_depth:
-            if not (target_depth == 1 and value_depth == 0 and value_type == 'char'):
-                self.warning(
-                    f"Pointer diepte mismatch in {context}: "
-                    f"verwacht {'*' * target_depth}{target_type}, "
-                    f"gevonden {'*' * value_depth}{value_type}."
-                )
+            is_null_ptr = (
+                target_depth > 0
+                and value_depth == 0
+                and isinstance(value_node, LiteralNode)
+                and value_node.value == 0
+            )
+            if not is_null_ptr:
+                if not (target_depth == 1 and value_depth == 0 and value_type == 'char'):
+                    self.error(                          # ← was: self.warning
+                        f"Pointer diepte mismatch in {context}: "
+                        f"verwacht {'*' * target_depth}{target_type}, "
+                        f"gevonden {'*' * value_depth}{value_type}."
+                    )
             return
 
         # Const casting: const T* toewijzen aan T* is expliciet toegestaan.
@@ -875,10 +882,12 @@ class SemanticAnalysisVisitor:
         if target_depth == 0 and value_depth == 0:
             if target_type in TYPE_RANK and value_type in TYPE_RANK:
                 if TYPE_RANK[value_type] > TYPE_RANK[target_type]:
-                    self.warning(
-                        f"Mogelijke precisieverlies in {context}: "
-                        f"{value_type} naar {target_type}."
-                    )
+                    # Expliciete cast (int)f → programmeur is bewust, geen warning
+                    if not isinstance(value_node, CastNode):
+                        self.warning(
+                            f"Mogelijke precisieverlies in {context}: "
+                            f"{value_type} naar {target_type}."
+                        )
 
     # --------------------------------------------------------
     # EXPRESSIES (ongewijzigd van assignment 3, behalve visitVariable)

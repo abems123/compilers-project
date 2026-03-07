@@ -301,7 +301,7 @@ returnStmt
 //   enum_type heeft twee tokens (ENUM_KW + ID), terwijl baseType altijd
 //   één token is. Door het apart te houden blijft baseType simpel.
 type
-    : CONST_KW? baseType STAR*   // int, float, char (met optionele const en pointers)
+    : CONST_KW? baseType CONST_KW? STAR*   // int, float, char (met optionele const en pointers)
     | ENUM_KW ID                 // enum Status  (geen const/pointer voor enums)
     ;
 
@@ -446,7 +446,7 @@ fragment DIGIT : [0-9] ;
 INTEGER : DIGIT+ ;
 FLOAT   : DIGIT+ '.' DIGIT+ ;
 
-CHAR   : '\'' ( '\\' [btnfr'\\] | ~['\\\r\n] ) '\'' ;
+CHAR   : '\'' ( '\\' [btnfr0'\\] | ~['\\\r\n] ) '\'' ;
 STRING : '"' ( '\\' [ntr"\\] | ~["\\\r\n] )* '"' ;
 
 // Identifier (NA keywords, zodat 'if' niet als ID herkend wordt)

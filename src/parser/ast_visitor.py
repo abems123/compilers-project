@@ -591,7 +591,8 @@ class CSTtoASTVisitor(ParseTreeVisitor):
             return TypeNode(enum_name, pointer_depth=0, is_const=False)
 
         # bestaand gedrag (ongewijzigd van assignment 3)
-        is_const      = ctx.CONST_KW() is not None
+        const_tokens = ctx.CONST_KW()
+        is_const = len(const_tokens) > 0 if isinstance(const_tokens, list) else (const_tokens is not None)
         base_type     = self.visit(ctx.baseType())
         pointer_depth = len(ctx.STAR())
         return TypeNode(base_type, pointer_depth, is_const)
